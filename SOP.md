@@ -1,6 +1,6 @@
 # 🚀 AGENT_SOP.md — Standard Operating Protocol for AI Agents
 ### Applies to: Antigravity IDE · Gemini CLI · Claude Code · Cursor · Codex CLI · OpenCode · AdaL CLI
-### Version: 3.0.0 — FINAL | Maintainer: RapidXAI | February 2026
+### Version: 3.0.0 — FINAL | Maintainer: Sahay AI | February 2026
 ### Source Skills: Antigravity Awesome Skills (868+ skills) — github.com/sickn33/antigravity-awesome-skills
 
 ---
@@ -1190,9 +1190,9 @@ Before ending ANY work session, every item must be checked:
 
 ---
 
-## 🎯 RAPIDXAI PROJECT TYPE QUICK-SELECT
+## 🎯 SAHAY AI PROJECT TYPE QUICK-SELECT
 
-For RapidXAI client work specifically, use these pre-selected stacks:
+For Sahay AI client work specifically, use these pre-selected stacks:
 
 | Client Type | Lead Skills Tandem | Support Skills |
 |---|---|---|
@@ -1201,10 +1201,10 @@ For RapidXAI client work specifically, use these pre-selected stacks:
 | E-Commerce / Shopify | `@stripe-integration + @frontend-developer` | `@ui-ux-pro-max + @form-cro + @seo-audit` |
 | Dental / Hair Salon | `@ai-agents-architect + @twilio-communications` | `@ui-ux-pro-max + @copywriting + @seo-audit` |
 | Tour Operators | `@senior-fullstack + @database-design` | `@ui-ux-pro-max + @react-patterns + @stripe-integration` |
-| SaaS Product (RapidXAI) | `@senior-fullstack + @ai-agents-architect` | `@react-best-practices + @api-security-best-practices + @product-manager-toolkit` |
+| SaaS Product (Sahay AI) | `@senior-fullstack + @ai-agents-architect` | `@react-best-practices + @api-security-best-practices + @product-manager-toolkit` |
 
 ---
 
 *This SOP is a living document. Every agent that reads it is expected to follow it with zero deviation unless explicitly overridden by the project owner. It is updated as the project evolves, new skills are discovered, and better tandem combinations are found.*
 
-*Built for RapidXAI. Powered by Antigravity Awesome Skills (868+ skills — github.com/sickn33/antigravity-awesome-skills). February 2026.*
+*Built for Sahay AI. Powered by Antigravity Awesome Skills (868+ skills — github.com/sickn33/antigravity-awesome-skills). February 2026.*

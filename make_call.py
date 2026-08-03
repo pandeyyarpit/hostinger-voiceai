@@ -23,9 +23,10 @@ async def main():
     url = os.getenv("LIVEKIT_URL")
     api_key = os.getenv("LIVEKIT_API_KEY")
     api_secret = os.getenv("LIVEKIT_API_SECRET")
+    trunk_id = os.getenv("OUTBOUND_TRUNK_ID")
 
-    if not (url and api_key and api_secret):
-        print("Error: LiveKit credentials missing in .env.local")
+    if not (url and api_key and api_secret and trunk_id):
+        print("Error: LiveKit credentials or OUTBOUND_TRUNK_ID missing in .env")
         return
 
     # 2. Setup API Client
@@ -49,6 +50,16 @@ async def main():
         )
         
         dispatch = await lk_api.agent_dispatch.create_dispatch(dispatch_request)
+
+        await lk_api.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                room_name=room_name,
+                sip_trunk_id=trunk_id,
+                sip_call_to=phone_number,
+                participant_identity=f"sip_{phone_number.replace('+', '')}",
+                participant_name=phone_number,
+            )
+        )
 
         print("\n✅ Call Dispatched Successfully!")
         print(f"Dispatch ID: {dispatch.id}")

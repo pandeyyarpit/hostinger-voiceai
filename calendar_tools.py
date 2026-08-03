@@ -245,7 +245,7 @@ async def _create_booking_gcal(
 
         event = {
             "summary":     f"Appointment — {caller_name}",
-            "description": f"Phone: {caller_phone}\nNotes: {notes}\nBooked via RapidX AI Voice Agent",
+            "description": f"Phone: {caller_phone}\nNotes: {notes}\nBooked via Sahay AI Voice Agent",
             "start":       {"dateTime": dt_start.isoformat(), "timeZone": "Asia/Kolkata"},
             "end":         {"dateTime": dt_end.isoformat(),   "timeZone": "Asia/Kolkata"},
             "attendees":   [{"displayName": caller_name, "comment": caller_phone}],

@@ -228,11 +228,14 @@ class AgentTools(llm.ToolContext):
         self,
         start_time:   Annotated[str,  "ISO 8601 datetime e.g. '2026-03-01T10:00:00+05:30'"],
         caller_name:  Annotated[str,  "Full name of the caller"],
-        caller_phone: Annotated[str,  "Phone number of the caller"],
-        caller_email: Annotated[str,  "Email address of the caller as spoken on the call"],
+        caller_phone: Annotated[str,  "Phone number of the caller; omit when it is already known from the call" ] = "",
+        caller_email: Annotated[str,  "Email address of the caller as spoken on the call" ] = "",
         notes:        Annotated[str,  "Any additional notes or special requests"] = "",
     ) -> str:
+        caller_phone = caller_phone.strip() or self.caller_phone
         logger.info(f"[TOOL] save_booking_intent: {caller_name} at {start_time}, email={caller_email}")
+        if not caller_phone or caller_phone == "unknown":
+            return "I still need the caller's phone number before I can save the appointment."
         try:
             self.booking_intent = {
                 "start_time":   start_time,
@@ -303,7 +306,15 @@ class OutboundAssistant(Agent):
         ist_context       = get_ist_time_context()
         lang_preset       = live_config_loaded.get("lang_preset", "multilingual")
         lang_instruction  = get_language_instruction(lang_preset)
-        final_instructions = base_instructions + ist_context + lang_instruction
+        booking_instruction = (
+            "\n\n[BOOKING ACTION — STRICT]\n"
+            "When the caller agrees to an appointment date and time, collect their name and ask for their email. "
+            "Before saying that an appointment is booked or confirmed, you MUST call save_booking_intent during the active call. "
+            "Pass the confirmed ISO date/time and the caller's name. The caller's phone number is already known for outbound calls, "
+            "so you may omit caller_phone unless the caller gives a different number. Email is optional if the caller declines it. "
+            "Never claim that a booking is confirmed until save_booking_intent returns success."
+        )
+        final_instructions = base_instructions + ist_context + lang_instruction + booking_instruction
 
         # Token counter (#11)
         token_count = count_tokens(final_instructions)
@@ -317,7 +328,7 @@ class OutboundAssistant(Agent):
         greeting = self._live_config.get(
             "first_line",
             self._first_line or (
-                "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. "
+                "Namaste! This is Ria from Sahay AI — a physiotherapy clinic. "
                 "Hmm, may I ask what kind of business you run?"
             )
         )
