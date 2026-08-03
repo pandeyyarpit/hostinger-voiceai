@@ -10,9 +10,21 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ui-server")
 
-app = FastAPI(title="RapidX AI Dashboard")
+app = FastAPI(title="Sahay AI Dashboard")
 
 CONFIG_FILE = "config.json"
+CREDENTIAL_CONFIG_KEYS = {
+    "livekit_api_key",
+    "livekit_api_secret",
+    "openai_api_key",
+    "sarvam_api_key",
+    "cal_api_key",
+    "telegram_bot_token",
+    "telegram_chat_id",
+    "supabase_key",
+    "vobiz_username",
+    "vobiz_password",
+}
 
 def read_config():
     config = {}
@@ -24,14 +36,15 @@ def read_config():
         return config.get(key) if config.get(key) else os.getenv(env_key, default)
 
     return {
-        "first_line": get_val("first_line", "FIRST_LINE", "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. Hmm, may I ask what kind of business you run?"),
+        **config,
+        "first_line": get_val("first_line", "FIRST_LINE", "Namaste! This is Ria from Sahay AI — a physiotherapy clinic. Hmm, are you looking for an appointment?"),
         "agent_instructions": get_val("agent_instructions", "AGENT_INSTRUCTIONS", ""),
         "stt_min_endpointing_delay": float(get_val("stt_min_endpointing_delay", "STT_MIN_ENDPOINTING_DELAY", 0.6)),
         "llm_model": get_val("llm_model", "LLM_MODEL", "gpt-4o-mini"),
         "tts_voice": get_val("tts_voice", "TTS_VOICE", "kavya"),
         "tts_language": get_val("tts_language", "TTS_LANGUAGE", "hi-IN"),
         "livekit_url": get_val("livekit_url", "LIVEKIT_URL", ""),
-        "sip_trunk_id": get_val("sip_trunk_id", "SIP_TRUNK_ID", ""),
+        "sip_trunk_id": get_val("sip_trunk_id", "OUTBOUND_TRUNK_ID", ""),
         "livekit_api_key": get_val("livekit_api_key", "LIVEKIT_API_KEY", ""),
         "livekit_api_secret": get_val("livekit_api_secret", "LIVEKIT_API_SECRET", ""),
         "openai_api_key": get_val("openai_api_key", "OPENAI_API_KEY", ""),
@@ -42,12 +55,15 @@ def read_config():
         "telegram_chat_id": get_val("telegram_chat_id", "TELEGRAM_CHAT_ID", ""),
         "supabase_url": get_val("supabase_url", "SUPABASE_URL", ""),
         "supabase_key": get_val("supabase_key", "SUPABASE_KEY", ""),
-        **config
     }
 
 def write_config(data):
-    config = read_config()
-    config.update(data)
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+
+    config.update({key: value for key, value in data.items() if key not in CREDENTIAL_CONFIG_KEYS})
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
 
@@ -171,7 +187,7 @@ DEMO_PAGE_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Voice Demo — RapidX AI</title>
+  <title>AI Voice Demo — Sahay AI</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
@@ -196,7 +212,7 @@ DEMO_PAGE_HTML = """<!DOCTYPE html>
   <div class="card">
     <div class="avatar">🎙</div>
     <h1>Talk to Aryan</h1>
-    <div class="sub">AI-powered multilingual consultant · RapidX AI</div>
+    <div class="sub">AI-powered multilingual clinic assistant · Sahay AI</div>
     <button class="btn btn-start" id="startBtn" onclick="startCall()">📞 Start Demo Call</button>
     <button class="btn btn-end" id="endBtn" onclick="endCall()">📵 End Call</button>
     <div id="status">Click to start a live voice demo</div>
@@ -262,6 +278,9 @@ async def api_call_single(request: Request):
     try:
         import random, json as _json
         from livekit import api as lkapi
+        trunk_id = config.get("sip_trunk_id") or os.environ.get("OUTBOUND_TRUNK_ID", "")
+        if not trunk_id:
+            return {"status": "error", "message": "Outbound SIP trunk ID is not configured"}
         lk = lkapi.LiveKitAPI(
             url=config.get("livekit_url") or os.environ.get("LIVEKIT_URL",""),
             api_key=config.get("livekit_api_key") or os.environ.get("LIVEKIT_API_KEY",""),
@@ -273,6 +292,15 @@ async def api_call_single(request: Request):
                 agent_name="outbound-caller",
                 room=room_name,
                 metadata=_json.dumps({"phone_number": phone}),
+            )
+        )
+        await lk.sip.create_sip_participant(
+            lkapi.CreateSIPParticipantRequest(
+                room_name=room_name,
+                sip_trunk_id=trunk_id,
+                sip_call_to=phone,
+                participant_identity=f"sip_{phone.replace('+', '')}",
+                participant_name=phone,
             )
         )
         await lk.aclose()
@@ -294,6 +322,9 @@ async def api_call_bulk(request: Request):
     lk_url    = cfg.get("livekit_url")    or os.environ.get("LIVEKIT_URL","")
     lk_key    = cfg.get("livekit_api_key")    or os.environ.get("LIVEKIT_API_KEY","")
     lk_secret = cfg.get("livekit_api_secret") or os.environ.get("LIVEKIT_API_SECRET","")
+    trunk_id  = cfg.get("sip_trunk_id") or os.environ.get("OUTBOUND_TRUNK_ID", "")
+    if not trunk_id:
+        return {"results": [{"phone": phone, "status": "error", "message": "Outbound SIP trunk ID is not configured"} for phone in numbers], "total": len(numbers)}
     for phone in numbers:
         if not phone.startswith("+"):
             results.append({"phone": phone, "status": "error", "message": "Must start with +"})
@@ -306,6 +337,15 @@ async def api_call_bulk(request: Request):
                     agent_name="outbound-caller",
                     room=room_name,
                     metadata=_json.dumps({"phone_number": phone}),
+                )
+            )
+            await lk.sip.create_sip_participant(
+                lkapi.CreateSIPParticipantRequest(
+                    room_name=room_name,
+                    sip_trunk_id=trunk_id,
+                    sip_call_to=phone,
+                    participant_identity=f"sip_{phone.replace('+', '')}",
+                    participant_name=phone,
                 )
             )
             await lk.aclose()
@@ -400,7 +440,7 @@ def health_check():
     return {
         "status": "ok",
         "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
-        "service": "rapidx-ai-voice-agent",
+        "service": "sahay-ai-voice-agent",
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -614,7 +654,7 @@ async def get_dashboard():
     </div>
     <div>
       <div class="brand-text">Voice Agent</div>
-      <div class="brand-sub">RapidX AI</div>
+      <div class="brand-sub">Sahay AI</div>
     </div>
   </div>
   <div class="sidebar-nav">
@@ -697,7 +737,7 @@ async def get_dashboard():
       <div class="section-title">Opening Greeting</div>
       <div class="form-group">
         <label>First Line (What the agent says when a call connects)</label>
-        <input type="text" id="first_line" value="{config.get('first_line', '')}" placeholder="Namaste! This is Aryan from RapidX AI...">
+        <input type="text" id="first_line" value="{config.get('first_line', '')}" placeholder="Namaste! This is Ria from Sahay AI...">
         <div class="hint">This is the very first thing the agent says. Keep it concise and warm.</div>
       </div>
     </div>
@@ -1247,7 +1287,7 @@ function renderLangGrid() {{
       border:2px solid ${{id===currentLangPreset ? p.color : 'var(--border)'}};
       border-radius:12px;padding:18px;cursor:pointer;transition:all 0.15s;
       ${{id===currentLangPreset ? 'box-shadow:0 0 16px rgba(108,99,255,0.2)' : ''}}
-    " onmouseover="this.style.borderColor='${{p.color}}'" onmouseout="this.style.borderColor='${{id===currentLangPreset?p.color:'var(--border)}}'">
+    " onmouseover="this.style.borderColor='${{p.color}}'" onmouseout="this.style.borderColor='${{id===currentLangPreset?p.color:'var(--border)'}}'">
       <div style="font-size:28px;margin-bottom:8px;">${{p.flag}}</div>
       <div style="font-weight:700;font-size:14px;color:${{id===currentLangPreset?p.color:'var(--text)'}}">${{p.label}}</div>
       <div style="font-size:11px;color:var(--muted);margin-top:3px;">${{p.sub}}</div>
