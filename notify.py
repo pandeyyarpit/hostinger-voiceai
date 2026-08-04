@@ -146,6 +146,33 @@ def notify_booking_cancelled(
     return send_telegram(message)
 
 
+def notify_booking_failed(
+    caller_name: str,
+    caller_phone: str,
+    booking_time_iso: str,
+    reason: str = "",
+) -> bool:
+    """Alert the team when Cal.com rejects a requested appointment."""
+    try:
+        readable = datetime.fromisoformat(booking_time_iso.replace("Z", "+00:00")).strftime(
+            "%A, %d %B %Y at %-I:%M %p IST"
+        )
+    except Exception:
+        readable = booking_time_iso
+
+    message = (
+        f"⚠️ *Booking Failed — Follow Up Needed*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *Name:*      {caller_name or 'Unknown'}\n"
+        f"📞 *Phone:*     `{caller_phone}`\n"
+        f"📅 *Requested:* {readable}\n"
+        f"🔴 *Reason:*    {reason[:500] or 'Cal.com rejected the requested slot'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Please contact the caller with an available time._"
+    )
+    return send_telegram(message)
+
+
 def notify_call_no_booking(
     caller_name: str,
     caller_phone: str,

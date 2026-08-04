@@ -153,9 +153,18 @@ def get_language_instruction(lang_preset: str) -> str:
 
 # ── External imports ──────────────────────────────────────────────────────────
 import db  # FIX: was missing — db.get_supabase() used throughout
-from calendar_tools import get_available_slots, create_booking, cancel_booking
+from calendar_tools import (
+    get_available_slots,
+    is_slot_available,
+    normalize_email,
+    is_valid_email,
+    async_create_booking,
+    create_booking,
+    cancel_booking,
+)
 from notify import (
     notify_booking_confirmed,
+    notify_booking_failed,
     notify_booking_cancelled,
     notify_call_no_booking,
     notify_agent_error,
@@ -173,10 +182,15 @@ class AgentTools(llm.ToolContext):
         self.caller_phone        = caller_phone
         self.caller_name         = caller_name
         self.booking_intent: dict | None = None
+        self.booking_result: dict | None = None
+        self.booking_notification_sent = False
+        self.last_booking_failure: dict | None = None
         self.sip_domain          = os.getenv("VOBIZ_SIP_DOMAIN")
         self.ctx_api             = None
+        self.job_ctx             = None
         self.room_name           = None
         self._sip_identity       = None
+        self._auto_end_task      = None
 
     # ── Tool: Transfer to Human ───────────────────────────────────────────
     @llm.function_tool(description="Transfer this call to a human agent. Use if: caller asks for human, is angry, or query is outside scope.")
@@ -204,26 +218,37 @@ class AgentTools(llm.ToolContext):
             logger.error(f"Transfer failed: {e}")
             return "Unable to transfer right now."
 
+    async def _terminate_call(self) -> bool:
+        try:
+            if self.job_ctx:
+                # Deleting the LiveKit room reliably disconnects every participant,
+                # including the outbound SIP caller.
+                await self.job_ctx.delete_room(self.room_name)
+                return True
+            logger.warning("[END-CALL] Job context unavailable; cannot end call safely.")
+        except Exception as e:
+            logger.warning(f"[END-CALL] Room deletion failed: {e}")
+        return False
+
     # ── Tool: End Call ────────────────────────────────────────────────────
     @llm.function_tool(description="End the call. Use ONLY when caller says bye/goodbye or after booking is fully confirmed.")
     async def end_call(self) -> str:
         logger.info("[TOOL] end_call triggered — hanging up.")
+        return "Call ended." if await self._terminate_call() else "Unable to end the call right now."
+
+    async def _auto_end_after_booking_request(self) -> None:
+        """End a paid SIP call shortly after a confirmed booking."""
         try:
-            if self.ctx_api and self.room_name and self._sip_identity:
-                await self.ctx_api.sip.transfer_sip_participant(
-                    api.TransferSIPParticipantRequest(
-                        room_name=self.room_name,
-                        participant_identity=self._sip_identity,
-                        transfer_to="tel:+00000000",
-                        play_dialtone=False,
-                    )
-                )
+            # Leave a short pause so the caller can hear the request acknowledgement,
+            # then terminate the SIP room to prevent an idle billed call.
+            await asyncio.sleep(5)
+            logger.info("[BOOKING] Auto-ending call after booking request.")
+            await self._terminate_call()
         except Exception as e:
-            logger.warning(f"[END-CALL] SIP hangup failed: {e}")
-        return "Call ended."
+            logger.warning(f"[BOOKING] Auto-end failed: {e}")
 
     # ── Tool: Save Booking Intent ─────────────────────────────────────────
-    @llm.function_tool(description="Save booking intent after caller confirms appointment. Call this ONCE after you have name, phone, email, date, time.")
+    @llm.function_tool(description="Create the Cal.com appointment immediately after caller confirms a slot and provides name/email. Call this ONCE with the exact ISO slot. It returns the real booking result.")
     async def save_booking_intent(
         self,
         start_time:   Annotated[str,  "ISO 8601 datetime e.g. '2026-03-01T10:00:00+05:30'"],
@@ -233,22 +258,75 @@ class AgentTools(llm.ToolContext):
         notes:        Annotated[str,  "Any additional notes or special requests"] = "",
     ) -> str:
         caller_phone = caller_phone.strip() or self.caller_phone
+        caller_email = normalize_email(caller_email)
         logger.info(f"[TOOL] save_booking_intent: {caller_name} at {start_time}, email={caller_email}")
         if not caller_phone or caller_phone == "unknown":
             return "I still need the caller's phone number before I can save the appointment."
+        if caller_email and not is_valid_email(caller_email):
+            return (
+                "The email address is invalid. Ask the caller to repeat it slowly, letter by letter, "
+                "then call save_booking_intent again. Do not save or confirm the appointment yet."
+            )
+        available, alternatives = is_slot_available(start_time)
+        if not available:
+            suggestions = ", ".join(alternatives[:6])
+            if suggestions:
+                return (
+                    f"That requested time is not available. Offer the caller one of these available times: "
+                    f"{suggestions} IST. Do not say the appointment is booked."
+                )
+            return (
+                "I could not validate that requested time with the calendar. Ask the caller to choose "
+                "another time or try again later. Do not say the appointment is booked."
+            )
+        if self.booking_result and self.booking_result.get("success"):
+            return "This appointment is already confirmed. Thank the caller and end the call."
+
+        intent = {
+            "start_time":   start_time,
+            "caller_name":  caller_name,
+            "caller_phone": caller_phone,
+            "caller_email": caller_email,
+            "notes":        notes,
+        }
         try:
-            self.booking_intent = {
-                "start_time":   start_time,
-                "caller_name":  caller_name,
-                "caller_phone": caller_phone,
-                "caller_email": caller_email,
-                "notes":        notes,
-            }
-            self.caller_name = caller_name
-            return f"Booking intent saved for {caller_name} at {start_time}. I'll confirm after the call."
+            # Create the booking while the caller is still connected. Previously
+            # this only saved an intent and waited for shutdown, which allowed the
+            # conversation to loop and left a gap between acknowledgement and Cal.com.
+            result = await async_create_booking(**intent)
         except Exception as e:
-            logger.error(f"[TOOL] save_booking_intent failed: {e}")
-            return "I had trouble saving the booking. Please try again."
+            logger.error(f"[TOOL] Immediate booking failed: {e}")
+            result = {"success": False, "booking_id": None, "message": str(e)}
+
+        if not result.get("success"):
+            self.last_booking_failure = {**intent, "message": result.get("message", "Booking failed")}
+            available_now, fresh_alternatives = is_slot_available(start_time)
+            suggestions = ", ".join((fresh_alternatives or alternatives)[:6])
+            if suggestions:
+                return (
+                    f"The appointment was not created: {result.get('message', 'calendar rejected the slot')}. "
+                    f"Offer one of these available times instead: {suggestions} IST. Do not say it is booked."
+                )
+            return "The appointment was not created. Apologize and offer to try another time. Do not say it is booked."
+
+        self.booking_intent = intent
+        self.booking_result = result
+        self.last_booking_failure = None
+        self.caller_name = caller_name
+        notify_booking_confirmed(
+            caller_name=caller_name,
+            caller_phone=caller_phone,
+            booking_time_iso=start_time,
+            booking_id=result.get("booking_id", "unknown"),
+            notes=notes,
+        )
+        self.booking_notification_sent = True
+        if not self._auto_end_task or self._auto_end_task.done():
+            self._auto_end_task = asyncio.create_task(self._auto_end_after_booking_request())
+        return (
+            "The appointment is confirmed in Cal.com. Tell the caller exactly: "
+            "'Your appointment is confirmed. You will receive the details shortly.' Then say goodbye; the call will end automatically."
+        )
 
     # ── Tool: Check Availability (#13) ────────────────────────────────────
     @llm.function_tool(description="Check available appointment slots for a given date. Call this when user asks about availability.")
@@ -309,10 +387,11 @@ class OutboundAssistant(Agent):
         booking_instruction = (
             "\n\n[BOOKING ACTION — STRICT]\n"
             "When the caller agrees to an appointment date and time, collect their name and ask for their email. "
-            "Before saying that an appointment is booked or confirmed, you MUST call save_booking_intent during the active call. "
+            "As soon as the caller gives a final listed slot, name, and valid email, you MUST call save_booking_intent during the active call. "
             "Pass the confirmed ISO date/time and the caller's name. The caller's phone number is already known for outbound calls, "
             "so you may omit caller_phone unless the caller gives a different number. Email is optional if the caller declines it. "
-            "Never claim that a booking is confirmed until save_booking_intent returns success."
+            "Do not ask for the email again, re-check availability, or offer other slots after the caller has confirmed a listed slot. "
+            "Never say a booking is confirmed before the tool returns success. If it succeeds, say it is confirmed; if it fails, offer only the alternatives returned by the tool."
         )
         final_instructions = base_instructions + ist_context + lang_instruction + booking_instruction
 
@@ -438,6 +517,7 @@ async def entrypoint(ctx: JobContext):
         f"sip_{caller_phone.replace('+','')}" if phone_number else "inbound_caller"
     )
     agent_tools.ctx_api   = ctx.api
+    agent_tools.job_ctx   = ctx
     agent_tools.room_name = ctx.room.name
 
     # ── Build LLM (#8 Groq support) ───────────────────────────────────────
@@ -693,42 +773,71 @@ async def entrypoint(ctx: JobContext):
         global agent_is_speaking
         logger.info(f"[HANGUP] Participant disconnected: {participant.identity}")
         agent_is_speaking = False
-        asyncio.create_task(unified_shutdown_hook(ctx))
+        # The LiveKit job shutdown callback below owns all post-call work.
+        # Running it here too could submit the same Cal.com booking twice.
+
+    shutdown_started = False
 
     # ══════════════════════════════════════════════════════════════════════
     # POST-CALL SHUTDOWN HOOK
     # ══════════════════════════════════════════════════════════════════════
 
     async def unified_shutdown_hook(shutdown_ctx: JobContext):
+        nonlocal shutdown_started
+        if shutdown_started:
+            logger.warning("[SHUTDOWN] Duplicate shutdown callback ignored.")
+            return
+        shutdown_started = True
         logger.info("[SHUTDOWN] Sequence started.")
 
         duration = int((datetime.now() - call_start_time).total_seconds())
 
         # Booking
         booking_status_msg = "No booking"
+        booking_succeeded = False
         if agent_tools.booking_intent:
-            from calendar_tools import async_create_booking
             intent = agent_tools.booking_intent
-            result = await async_create_booking(
-                start_time=intent["start_time"],
-                caller_name=intent["caller_name"] or "Unknown Caller",
-                caller_phone=intent["caller_phone"],
-                caller_email=intent.get("caller_email", ""),
-                notes=intent.get("notes", ""),
-            )
+            # Normal path: the transaction already completed in the tool while
+            # the caller was connected. Keep the fallback for older in-flight jobs.
+            result = agent_tools.booking_result
+            if result is None:
+                result = await async_create_booking(
+                    start_time=intent["start_time"],
+                    caller_name=intent["caller_name"] or "Unknown Caller",
+                    caller_phone=intent["caller_phone"],
+                    caller_email=intent.get("caller_email", ""),
+                    notes=intent.get("notes", ""),
+                )
             if result.get("success"):
-                notify_booking_confirmed(
+                if not agent_tools.booking_notification_sent:
+                    notify_booking_confirmed(
+                        caller_name=intent["caller_name"],
+                        caller_phone=intent["caller_phone"],
+                        booking_time_iso=intent["start_time"],
+                        booking_id=result.get("booking_id"),
+                        notes=intent.get("notes", ""),
+                        tts_voice=tts_voice,
+                        ai_summary="",
+                    )
+                booking_status_msg = f"Booking Confirmed: {result.get('booking_id')}"
+                booking_succeeded = True
+            else:
+                booking_status_msg = f"Booking Failed: {result.get('message')}"
+                notify_booking_failed(
                     caller_name=intent["caller_name"],
                     caller_phone=intent["caller_phone"],
                     booking_time_iso=intent["start_time"],
-                    booking_id=result.get("booking_id"),
-                    notes=intent.get("notes", ""),
-                    tts_voice=tts_voice,
-                    ai_summary="",
+                    reason=result.get("message", ""),
                 )
-                booking_status_msg = f"Booking Confirmed: {result.get('booking_id')}"
-            else:
-                booking_status_msg = f"Booking Failed: {result.get('message')}"
+        elif agent_tools.last_booking_failure:
+            failure = agent_tools.last_booking_failure
+            booking_status_msg = f"Booking Failed: {failure.get('message', 'Booking failed')}"
+            notify_booking_failed(
+                caller_name=failure.get("caller_name", ""),
+                caller_phone=failure.get("caller_phone", caller_phone),
+                booking_time_iso=failure.get("start_time", ""),
+                reason=failure.get("message", ""),
+            )
         else:
             notify_call_no_booking(
                 caller_name=agent_tools.caller_name,
@@ -756,23 +865,8 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"[SHUTDOWN] Transcript read failed: {e}")
             transcript_text = "unavailable"
 
-        # Sentiment analysis (#14)
-        sentiment = "unknown"
-        if transcript_text and transcript_text != "unavailable":
-            try:
-                import openai as _oai
-                _client = _oai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-                resp = await _client.chat.completions.create(
-                    model="gpt-4o-mini", max_tokens=5,
-                    messages=[{"role":"user","content":
-                        f"Classify this call as one word: positive, neutral, negative, or frustrated.\n\n{transcript_text[:800]}"}]
-                )
-                sentiment = resp.choices[0].message.content.strip().lower()
-                logger.info(f"[SENTIMENT] {sentiment}")
-            except Exception as e:
-                logger.warning(f"[SENTIMENT] Failed: {e}")
-
-        # Cost estimation (#34)
+        # Save the CRM record before optional post-call work. LiveKit can force
+        # the job to exit shortly after disconnecting the SIP participant.
         def estimate_cost(dur: int, chars: int) -> float:
             return round(
                 (dur / 60) * 0.002 +
@@ -787,6 +881,46 @@ async def entrypoint(ctx: JobContext):
         # Analytics timestamps (#19)
         ist = pytz.timezone("Asia/Kolkata")
         call_dt = call_start_time.astimezone(ist)
+
+        from db import save_call_log
+        save_result = save_call_log(
+            phone=caller_phone,
+            duration=duration,
+            transcript=transcript_text,
+            summary=booking_status_msg,
+            caller_name=agent_tools.caller_name or "",
+            sentiment="unknown",
+            estimated_cost_usd=estimated_cost,
+            call_date=call_dt.date().isoformat(),
+            call_hour=call_dt.hour,
+            call_day_of_week=call_dt.strftime("%A"),
+            was_booked=booking_succeeded,
+            interrupt_count=interrupt_count,
+        )
+        logger.info(f"[CRM] Call log saved: {save_result.get('success', False)}")
+        if not save_result.get("success", False):
+            # The call has ended, so this is the only chance to surface a CRM
+            # outage to the team instead of silently losing the dashboard entry.
+            notify_agent_error(
+                caller_phone,
+                f"CRM call-log save failed: {save_result.get('message', 'unknown error')}",
+            )
+
+        # Sentiment analysis (#14) is optional and must not delay CRM storage.
+        sentiment = "unknown"
+        if transcript_text and transcript_text != "unavailable":
+            try:
+                import openai as _oai
+                _client = _oai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+                resp = await _client.chat.completions.create(
+                    model="gpt-4o-mini", max_tokens=5,
+                    messages=[{"role":"user","content":
+                        f"Classify this call as one word: positive, neutral, negative, or frustrated.\n\n{transcript_text[:800]}"}]
+                )
+                sentiment = resp.choices[0].message.content.strip().lower()
+                logger.info(f"[SENTIMENT] {sentiment}")
+            except Exception as e:
+                logger.warning(f"[SENTIMENT] Failed: {e}")
 
         # Stop recording
         recording_url = ""
@@ -822,7 +956,7 @@ async def entrypoint(ctx: JobContext):
                         "phone":        caller_phone,
                         "caller_name":  agent_tools.caller_name,
                         "duration":     duration,
-                        "booked":       bool(agent_tools.booking_intent),
+                        "booked":       booking_succeeded,
                         "sentiment":    sentiment,
                         "summary":      booking_status_msg,
                         "recording_url":recording_url,
@@ -832,24 +966,6 @@ async def entrypoint(ctx: JobContext):
                 logger.info("[N8N] Webhook triggered")
             except Exception as e:
                 logger.warning(f"[N8N] Webhook failed: {e}")
-
-        # Save to Supabase
-        from db import save_call_log
-        save_call_log(
-            phone=caller_phone,
-            duration=duration,
-            transcript=transcript_text,
-            summary=booking_status_msg,
-            recording_url=recording_url,
-            caller_name=agent_tools.caller_name or "",
-            sentiment=sentiment,
-            estimated_cost_usd=estimated_cost,
-            call_date=call_dt.date().isoformat(),
-            call_hour=call_dt.hour,
-            call_day_of_week=call_dt.strftime("%A"),
-            was_booked=bool(agent_tools.booking_intent),
-            interrupt_count=interrupt_count,
-        )
 
     ctx.add_shutdown_callback(unified_shutdown_hook)
 

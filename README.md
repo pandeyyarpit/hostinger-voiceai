@@ -131,5 +131,15 @@ uv run python make_call.py --to +919988776655 (your number)
     - Ensure the phone number includes the country code (e.g., `+91`).
 
 - **No audio?**
-    - Check OpenAI/Deepgram API keys.
-    - Check the agent logs for errors.
+  - Check OpenAI/Deepgram API keys.
+  - Check the agent logs for errors.
+
+---
+
+## ✅ Regression Tests
+
+Run the offline booking-pipeline regression suite before deploying. It uses mocks only and does not place calls, create Cal.com bookings, or send notifications.
+
+```bash
+.venv/bin/python -m unittest -v tests/test_booking_pipeline.py
+```
