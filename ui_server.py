@@ -1398,6 +1398,17 @@ function copyDemoLink() {{
 
 // ── Boot ────────────────────────────────────────────────────────────────────
 loadDashboard();
+
+// Keep the dashboard current after a call finishes without requiring a manual
+// browser refresh. Only refresh the detailed page the user is viewing.
+async function refreshLiveData() {{
+  await loadDashboard();
+  const activePage = document.querySelector('.page.active')?.id?.replace('page-', '');
+  if (activePage === 'calendar') await loadCalendar();
+  if (activePage === 'crm') await loadCRM();
+  if (activePage === 'logs') await loadLogs();
+}}
+setInterval(refreshLiveData, 10000);
 </script>
 </body>
 </html>"""
