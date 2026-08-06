@@ -226,7 +226,9 @@ class AgentTools(llm.ToolContext):
         self.job_ctx             = None
         self.room_name           = None
         self._sip_identity       = None
-        self._auto_end_task      = None
+        self.session             = None
+        self._end_task           = None
+        self._closure_idle_task  = None
 
     # ── Tool: Transfer to Human ───────────────────────────────────────────
     @llm.function_tool(description="Transfer this call to a human agent. Use if: caller asks for human, is angry, or query is outside scope.")
@@ -267,21 +269,60 @@ class AgentTools(llm.ToolContext):
         return False
 
     # ── Tool: End Call ────────────────────────────────────────────────────
-    @llm.function_tool(description="End the call. Use ONLY when caller says bye/goodbye or after booking is fully confirmed.")
+    @llm.function_tool(
+        description=(
+            "End the call only after the caller clearly says bye, goodbye, that's all, no more help, "
+            "asks you to hang up, or uses thank you as a clear closing response. Never use only because a booking succeeded."
+        )
+    )
     async def end_call(self) -> str:
-        logger.info("[TOOL] end_call triggered — hanging up.")
-        return "Call ended." if await self._terminate_call() else "Unable to end the call right now."
+        logger.info("[TOOL] end_call triggered — goodbye will play before hangup.")
+        self.cancel_closure_idle()
+        self._schedule_end_after_goodbye("explicit conversation close")
+        return (
+            "Say exactly: 'Thank you for calling Sahay Health. Goodbye!' "
+            "Do not ask another question; the call will end automatically in five seconds."
+        )
 
-    async def _auto_end_after_booking_request(self) -> None:
-        """End a paid SIP call shortly after a confirmed booking."""
+    def _schedule_end_after_goodbye(self, reason: str) -> None:
+        if not self._end_task or self._end_task.done():
+            self._end_task = asyncio.create_task(self._end_after_goodbye(reason))
+
+    async def _end_after_goodbye(self, reason: str) -> None:
+        """Allow the final TTS goodbye to play before ending the paid SIP call."""
         try:
-            # Leave a short pause so the caller can hear the request acknowledgement,
-            # then terminate the SIP room to prevent an idle billed call.
             await asyncio.sleep(5)
-            logger.info("[BOOKING] Auto-ending call after booking request.")
+            logger.info("[END-CALL] Ending after goodbye: %s", reason)
             await self._terminate_call()
+        except asyncio.CancelledError:
+            logger.info("[END-CALL] Scheduled hangup cancelled: %s", reason)
         except Exception as e:
-            logger.warning(f"[BOOKING] Auto-end failed: {e}")
+            logger.warning(f"[END-CALL] Delayed hangup failed: {e}")
+
+    def cancel_closure_idle(self) -> None:
+        if self._closure_idle_task and not self._closure_idle_task.done():
+            self._closure_idle_task.cancel()
+        self._closure_idle_task = None
+
+    def _schedule_closure_idle(self, timeout_seconds: float = 20) -> None:
+        """Start a fallback only after the agent has explicitly asked if anything else is needed."""
+        self.cancel_closure_idle()
+        self._closure_idle_task = asyncio.create_task(self._close_if_no_reply(timeout_seconds))
+
+    async def _close_if_no_reply(self, timeout_seconds: float) -> None:
+        try:
+            await asyncio.sleep(timeout_seconds)
+            logger.info("[END-CALL] No reply after closing question; giving final goodbye.")
+            if self.session:
+                await self.session.generate_reply(
+                    instructions="Say exactly: 'Thank you for calling Sahay Health. Goodbye!' Do not ask another question."
+                )
+            await asyncio.sleep(5)
+            await self._terminate_call()
+        except asyncio.CancelledError:
+            logger.info("[END-CALL] Closing idle timer cancelled because caller continued.")
+        except Exception as e:
+            logger.warning(f"[END-CALL] Closing idle fallback failed: {e}")
 
     # ── Tool: Save Booking Intent ─────────────────────────────────────────
     @llm.function_tool(description="Create the Cal.com appointment immediately after caller confirms a slot and provides name/email. Call this ONCE with the exact ISO slot. It returns the real booking result.")
@@ -357,11 +398,11 @@ class AgentTools(llm.ToolContext):
             notes=notes,
         )
         self.booking_notification_sent = True
-        if not self._auto_end_task or self._auto_end_task.done():
-            self._auto_end_task = asyncio.create_task(self._auto_end_after_booking_request())
+        self._schedule_closure_idle(20)
         return (
             "The appointment is confirmed in Cal.com. Tell the caller exactly: "
-            "'Your appointment is confirmed. You will receive the details shortly.' Then say goodbye; the call will end automatically."
+            "'Your appointment is confirmed. Is there anything else I can help you with?' "
+            "Do not call end_call until the caller clearly closes the conversation."
         )
 
     # ── Tool: Check Availability (#13) ────────────────────────────────────
@@ -429,13 +470,23 @@ class OutboundAssistant(Agent):
             "Do not ask for the email again, re-check availability, or offer other slots after the caller has confirmed a listed slot. "
             "Never say a booking is confirmed before the tool returns success. If it succeeds, say it is confirmed; if it fails, offer only the alternatives returned by the tool."
         )
+        closing_instruction = (
+            "\n\n[CALL CLOSING — STRICT]\n"
+            "After a successful booking, ask once if the caller needs anything else and keep listening. "
+            "Call end_call only when the caller clearly says bye, goodbye, that's all, no more help, asks to hang up, "
+            "or uses thank you as a clear closing response. If the caller asks another question, continue helping. "
+            "Never end the call merely because the booking succeeded."
+        )
         voice_speed_instruction = (
             "\n\n[VOICE SPEED — STRICT]\n"
             "Use exactly one concise spoken sentence per turn, normally under 18 words. "
             "Do not add filler words, repeated acknowledgements, or a second explanation. "
             "Only list multiple times when the caller explicitly asks for available slots."
         )
-        final_instructions = base_instructions + ist_context + lang_instruction + booking_instruction + voice_speed_instruction
+        final_instructions = (
+            base_instructions + ist_context + lang_instruction + booking_instruction
+            + closing_instruction + voice_speed_instruction
+        )
 
         # Token counter (#11)
         token_count = count_tokens(final_instructions)
@@ -686,6 +737,7 @@ async def entrypoint(ctx: JobContext):
     attach_latency_logging(ctx.room.name, agent_stt, agent_llm, agent_tts)
 
     await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
+    agent_tools.session = session
 
     # ── TTS pre-warm (#12) ────────────────────────────────────────────────
     try:
@@ -792,6 +844,12 @@ async def entrypoint(ctx: JobContext):
         transcript = ev.user_transcript.strip()
         transcript_lower = transcript.lower().rstrip(".")
 
+        # Any real reply after the closing question means the conversation is
+        # continuing. A clear goodbye will invoke end_call and schedule a fresh
+        # five-second hangup through the tool.
+        if transcript:
+            agent_tools.cancel_closure_idle()
+
         if agent_is_speaking:
             logger.debug(f"[FILTER-ECHO] Dropped: '{transcript}'")
             return
@@ -814,6 +872,7 @@ async def entrypoint(ctx: JobContext):
                     instructions="Politely wrap up: thank the caller, say they can call back anytime, and say a warm goodbye."
                 )
             )
+            agent_tools._schedule_end_after_goodbye("maximum turn limit")
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
