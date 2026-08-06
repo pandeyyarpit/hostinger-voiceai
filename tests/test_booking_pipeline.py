@@ -318,7 +318,7 @@ class SupabaseReliabilityTests(unittest.TestCase):
 
 
 class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_booking_tool_creates_calendar_booking_before_auto_hangup(self):
+    async def test_booking_tool_confirms_then_waits_for_conversation_close(self):
         from agent import AgentTools
 
         tools = AgentTools(caller_phone="+919315085245")
@@ -347,6 +347,9 @@ class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tools.booking_intent["caller_email"], "rahul123@gmail.com")
         self.assertTrue(tools.booking_notification_sent)
         self.assertIn("confirmed in Cal.com", reply)
+        self.assertIn("anything else", reply)
+        self.assertIsNone(tools._end_task)
+        self.assertIs(tools._closure_idle_task, scheduled_task)
 
     async def test_booking_tool_failure_does_not_start_hangup_or_claim_success(self):
         from agent import AgentTools
@@ -387,7 +390,7 @@ class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await tools._terminate_call())
         self.assertEqual(tools.job_ctx.deleted_room, "test-room")
 
-    async def test_booking_auto_hangup_waits_five_seconds_then_deletes_room(self):
+    async def test_explicit_end_call_waits_five_seconds_then_deletes_room(self):
         from agent import AgentTools
 
         class FakeJobContext:
@@ -396,16 +399,85 @@ class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
             async def delete_room(self, room_name):
                 self.deleted_room = room_name
 
+        sleep_calls = []
+
         async def fake_sleep(seconds):
-            self.assertEqual(seconds, 5)
+            sleep_calls.append(seconds)
 
         tools = AgentTools(caller_phone="+919315085245")
-        tools.room_name = "test-booking-room"
+        tools.room_name = "test-goodbye-room"
         tools.job_ctx = FakeJobContext()
-        with patch("agent.asyncio.sleep", fake_sleep):
-            await tools._auto_end_after_booking_request()
+        scheduled = []
 
-        self.assertEqual(tools.job_ctx.deleted_room, "test-booking-room")
+        def capture_task(coro):
+            scheduled.append(coro)
+            task = MagicMock()
+            task.done.return_value = False
+            return task
+
+        with patch("agent.asyncio.create_task", side_effect=capture_task):
+            reply = await tools.end_call()
+
+        self.assertIsNone(tools.job_ctx.deleted_room)
+        self.assertIn("Goodbye", reply)
+        self.assertEqual(len(scheduled), 1)
+
+        with patch("agent.asyncio.sleep", fake_sleep):
+            await scheduled[0]
+
+        self.assertEqual(sleep_calls, [5])
+        self.assertEqual(tools.job_ctx.deleted_room, "test-goodbye-room")
+
+    async def test_closing_idle_fallback_says_goodbye_then_deletes_room(self):
+        from agent import AgentTools
+
+        class FakeJobContext:
+            deleted_room = None
+
+            async def delete_room(self, room_name):
+                self.deleted_room = room_name
+
+        class FakeSession:
+            instructions = None
+
+            async def generate_reply(self, *, instructions):
+                self.instructions = instructions
+
+        sleep_calls = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        tools = AgentTools(caller_phone="+919315085245")
+        tools.room_name = "test-idle-room"
+        tools.job_ctx = FakeJobContext()
+        tools.session = FakeSession()
+
+        with patch("agent.asyncio.sleep", fake_sleep):
+            await tools._close_if_no_reply(20)
+
+        self.assertEqual(sleep_calls, [20, 5])
+        self.assertIn("Goodbye", tools.session.instructions)
+        self.assertEqual(tools.job_ctx.deleted_room, "test-idle-room")
+
+    def test_caller_activity_cancels_closing_idle_timer(self):
+        from agent import AgentTools
+
+        tools = AgentTools(caller_phone="+919315085245")
+        timer = MagicMock()
+        timer.done.return_value = False
+        tools._closure_idle_task = timer
+
+        tools.cancel_closure_idle()
+
+        timer.cancel.assert_called_once()
+        self.assertIsNone(tools._closure_idle_task)
+
+    def test_maximum_turn_limit_schedules_a_goodbye_hangup(self):
+        source = Path("agent.py").read_text()
+        limit_at = source.index("if turn_count >= max_turns:")
+        schedule_at = source.index('_schedule_end_after_goodbye("maximum turn limit")', limit_at)
+        self.assertGreater(schedule_at, limit_at)
 
     def test_crm_persistence_precedes_optional_shutdown_work(self):
         source = Path("agent.py").read_text()
