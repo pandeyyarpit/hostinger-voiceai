@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
 
@@ -79,6 +79,88 @@ async def api_post_config(request: Request):
     write_config(data)
     logger.info("Configuration updated via UI.")
     return {"status": "success"}
+
+
+# ── Appointment Confirmation Agent (private server-side Supabase tables) ─────
+
+@app.get("/api/confirmation/settings")
+async def api_get_confirmation_settings():
+    try:
+        from confirmation_store import get_settings
+        return get_settings()
+    except Exception as e:
+        logger.error("Confirmation settings read failed: %s", e)
+        raise HTTPException(status_code=503, detail="Confirmation settings are unavailable.")
+
+
+@app.put("/api/confirmation/settings")
+async def api_update_confirmation_settings(request: Request):
+    try:
+        from confirmation_store import update_settings
+        return update_settings(await request.json())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Confirmation settings update failed: %s", e)
+        raise HTTPException(status_code=503, detail="Confirmation settings could not be saved.")
+
+
+@app.get("/api/confirmation/contacts")
+async def api_get_confirmation_contacts():
+    try:
+        from confirmation_store import list_contact_preferences
+        return list_contact_preferences()
+    except Exception as e:
+        logger.error("Confirmation contacts read failed: %s", e)
+        raise HTTPException(status_code=503, detail="Confirmation contacts are unavailable.")
+
+
+@app.put("/api/confirmation/contacts/{phone}")
+async def api_update_confirmation_contact(phone: str, request: Request):
+    try:
+        from confirmation_store import set_contact_confirmation
+        data = await request.json()
+        return set_contact_confirmation(phone, data.get("enabled", False), data.get("reason", ""))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Confirmation contact update failed: %s", e)
+        raise HTTPException(status_code=503, detail="Contact preference could not be saved.")
+
+
+@app.get("/api/confirmation/appointments")
+async def api_get_manual_confirmation_appointments():
+    try:
+        from confirmation_store import list_manual_appointments
+        return list_manual_appointments()
+    except Exception as e:
+        logger.error("Manual appointments read failed: %s", e)
+        raise HTTPException(status_code=503, detail="Manual appointments are unavailable.")
+
+
+@app.post("/api/confirmation/appointments")
+async def api_create_manual_confirmation_appointment(request: Request):
+    try:
+        from confirmation_store import create_manual_appointment
+        return create_manual_appointment(await request.json())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Manual appointment create failed: %s", e)
+        raise HTTPException(status_code=503, detail="Manual appointment could not be saved.")
+
+
+@app.delete("/api/confirmation/appointments/{appointment_id}")
+async def api_delete_manual_confirmation_appointment(appointment_id: str):
+    try:
+        from confirmation_store import delete_manual_appointment
+        delete_manual_appointment(appointment_id)
+        return {"status": "deleted"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Manual appointment delete failed: %s", e)
+        raise HTTPException(status_code=503, detail="Manual appointment could not be removed.")
 
 @app.get("/api/logs")
 async def api_get_logs():
@@ -549,7 +631,7 @@ async def get_dashboard():
 
     /* ── Forms ── */
     label {{ display: block; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }}
-    input[type=text], input[type=password], input[type=number], select, textarea {{
+    input[type=text], input[type=password], input[type=number], input[type=time], input[type=datetime-local], select, textarea {{
       width: 100%; background: var(--bg); border: 1px solid var(--border);
       border-radius: 8px; padding: 10px 12px; color: var(--text); font-family: inherit;
       font-size: 13.5px; outline: none; transition: border-color 0.15s;
@@ -618,6 +700,13 @@ async def get_dashboard():
       font-size: 20px; cursor: pointer; line-height: 1;
     }}
     .modal-close:hover {{ color: var(--text); }}
+    .toggle-row {{ display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 16px; background:var(--bg); border:1px solid var(--border); border-radius:10px; margin-bottom:20px; }}
+    .toggle-switch {{ position:relative; width:48px; height:26px; flex:0 0 auto; }}
+    .toggle-switch input {{ opacity:0; width:0; height:0; }}
+    .toggle-slider {{ position:absolute; inset:0; cursor:pointer; background:#475569; border-radius:26px; transition:.2s; }}
+    .toggle-slider:before {{ content:''; position:absolute; width:20px; height:20px; left:3px; bottom:3px; background:white; border-radius:50%; transition:.2s; }}
+    .toggle-switch input:checked + .toggle-slider {{ background:var(--green); }}
+    .toggle-switch input:checked + .toggle-slider:before {{ transform:translateX(22px); }}
     @keyframes fadeIn {{ from {{ opacity:0 }} to {{ opacity:1 }} }}
     @keyframes slideUp {{ from {{ transform:translateY(20px); opacity:0 }} to {{ transform:translateY(0); opacity:1 }} }}
 
@@ -638,6 +727,58 @@ async def get_dashboard():
     <div class="modal-title" id="modal-date-title">Bookings</div>
     <div class="modal-sub" id="modal-date-sub"></div>
     <div id="modal-bookings-body"></div>
+  </div>
+</div>
+
+<!-- ── Confirmation Agent Modal ── -->
+<div class="modal-overlay" id="confirmation-modal" onclick="if(event.target===this)closeConfirmationModal()">
+  <div class="modal-box" style="position:relative;max-width:760px;max-height:90vh;overflow-y:auto;">
+    <button class="modal-close" onclick="closeConfirmationModal()">✕</button>
+    <div class="modal-title">📅 Confirmation Agent</div>
+    <div class="modal-sub">Automatically call booked patients before their appointment. Changes are saved securely on the server.</div>
+
+    <div class="toggle-row">
+      <div><div style="font-weight:700;">Enable confirmation calls</div><div class="hint">When off, no new confirmation calls are queued.</div></div>
+      <label class="toggle-switch"><input type="checkbox" id="confirmation-enabled"><span class="toggle-slider"></span></label>
+    </div>
+
+    <div class="form-row">
+      <div class="form-group"><label>Call before appointment (hours)</label><input type="number" id="confirmation-lead-hours" min="1" max="720" value="24"><div class="hint">Default: 24 hours</div></div>
+      <div class="form-group"><label>Maximum attempts</label><input type="number" id="confirmation-max-attempts" min="1" max="5" value="2"><div class="hint">No-answer calls only</div></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Calling window start (IST)</label><input type="time" id="confirmation-window-start" value="09:00"></div>
+      <div class="form-group"><label>Calling window end (IST)</label><input type="time" id="confirmation-window-end" value="19:00"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Retry delay (minutes)</label><input type="number" id="confirmation-retry-delay" min="5" max="10080" value="120"></div>
+      <div class="form-group"><label>Language</label><select id="confirmation-language"><option value="hi-IN">Hindi / Hinglish</option><option value="en-IN">English (India)</option></select></div>
+    </div>
+    <div class="form-group" style="max-width:360px;"><label>Confirmation voice</label><select id="confirmation-voice"><option value="kavya">Kavya — Female, Friendly</option><option value="priya">Priya — Female, Warm</option><option value="ritu">Ritu — Female, Soft</option><option value="neha">Neha — Female, Energetic</option><option value="rohan">Rohan — Male, Balanced</option><option value="dev">Dev — Male, Professional</option></select></div>
+    <div class="form-group"><label>Confirmation script</label><textarea id="confirmation-script" rows="4" placeholder="Hi {{name}}, this is Ria from Sahay Health. You have an appointment at {{time}}. Would you like to confirm it?"></textarea></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin:4px 0 24px;"><span id="confirmation-save-status" class="hint"></span><button class="btn btn-primary" onclick="saveConfirmationSettings()">💾 Save confirmation settings</button></div>
+
+    <div class="section-title">Manual appointment</div>
+    <div class="modal-sub">Add a number yourself. The optional confirmation-call time overrides the 24-hour rule for this appointment only.</div>
+    <div class="form-row">
+      <div class="form-group"><label>Patient name</label><input type="text" id="manual-appointment-name" placeholder="Rahul"></div>
+      <div class="form-group"><label>Phone number</label><input type="text" id="manual-appointment-phone" placeholder="+919876543210"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Appointment time (IST)</label><input type="datetime-local" id="manual-appointment-time"></div>
+      <div class="form-group"><label>Confirmation call time (optional, IST)</label><input type="datetime-local" id="manual-confirmation-time"><div class="hint">Blank = use configured lead time.</div></div>
+    </div>
+    <div class="form-group"><label>Notes (optional)</label><input type="text" id="manual-appointment-notes" placeholder="Follow-up physiotherapy session"></div>
+    <button class="btn btn-ghost btn-sm" onclick="addManualAppointment()">＋ Add manual appointment</button>
+    <div id="manual-appointment-list" style="margin:14px 0 24px;"></div>
+
+    <div class="section-title">Do-not-call contacts</div>
+    <div class="form-row" style="align-items:end;">
+      <div class="form-group"><label>Phone number</label><input type="text" id="confirmation-optout-phone" placeholder="+919876543210"></div>
+      <div class="form-group"><label>Reason (optional)</label><input type="text" id="confirmation-optout-reason" placeholder="Patient requested no calls"></div>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="addConfirmationOptOut()">＋ Add to do-not-call list</button>
+    <div id="confirmation-contact-list" style="margin-top:14px;"></div>
   </div>
 </div>
 
@@ -663,6 +804,7 @@ async def get_dashboard():
     <div class="nav-item" onclick="goTo('calendar', this); loadCalendar();"><span class="icon">📅</span> Calendar</div>
     <div class="nav-section" style="margin-top:12px;">Configuration</div>
     <div class="nav-item" onclick="goTo('agent', this)"><span class="icon">🤖</span> Agent Settings</div>
+    <div class="nav-item" onclick="openConfirmationModal()"><span class="icon">✅</span> Confirmation Agent</div>
     <div class="nav-item" onclick="goTo('models', this)"><span class="icon">🎙️</span> Models & Voice</div>
     <div class="nav-item" onclick="goTo('credentials', this)"><span class="icon">🔑</span> API Credentials</div>
     <div class="nav-section" style="margin-top:12px;">Data</div>
@@ -847,10 +989,11 @@ async def get_dashboard():
               <th style="padding:10px 12px;text-align:left;color:var(--muted);font-weight:500;">Total Calls</th>
               <th style="padding:10px 12px;text-align:left;color:var(--muted);font-weight:500;">Last Seen</th>
               <th style="padding:10px 12px;text-align:left;color:var(--muted);font-weight:500;">Status</th>
+              <th style="padding:10px 12px;text-align:left;color:var(--muted);font-weight:500;">Confirmation</th>
             </tr>
           </thead>
           <tbody id="crm-tbody">
-            <tr><td colspan="5" style="text-align:center;padding:32px;color:var(--muted);">Loading contacts...</td></tr>
+            <tr><td colspan="6" style="text-align:center;padding:32px;color:var(--muted);">Loading contacts...</td></tr>
           </tbody>
         </table>
       </div>
@@ -1183,15 +1326,179 @@ function closeDayModal() {{
 }}
 document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeDayModal(); }});
 
+// ── Appointment Confirmation Agent ─────────────────────────────────────────
+function confirmationError(message) {{
+  const el = document.getElementById('confirmation-save-status');
+  el.textContent = '❌ ' + message;
+  el.style.color = 'var(--red)';
+}}
+
+async function confirmationRequest(url, options = {{}}) {{
+  const res = await fetch(url, options);
+  if (!res.ok) {{
+    const body = await res.json().catch(() => ({{}}));
+    throw new Error(body.detail || 'Request failed');
+  }}
+  return res.json();
+}}
+
+function closeConfirmationModal() {{ document.getElementById('confirmation-modal').classList.remove('open'); }}
+
+async function openConfirmationModal() {{
+  document.getElementById('confirmation-modal').classList.add('open');
+  const status = document.getElementById('confirmation-save-status');
+  status.textContent = 'Loading settings…';
+  status.style.color = 'var(--muted)';
+  try {{
+    const settings = await confirmationRequest('/api/confirmation/settings');
+    document.getElementById('confirmation-enabled').checked = !!settings.enabled;
+    document.getElementById('confirmation-lead-hours').value = settings.lead_hours || 24;
+    document.getElementById('confirmation-max-attempts').value = settings.max_attempts || 2;
+    document.getElementById('confirmation-window-start').value = (settings.call_window_start || '09:00').slice(0,5);
+    document.getElementById('confirmation-window-end').value = (settings.call_window_end || '19:00').slice(0,5);
+    document.getElementById('confirmation-retry-delay').value = settings.retry_delay_minutes || 120;
+    document.getElementById('confirmation-language').value = settings.language || 'hi-IN';
+    document.getElementById('confirmation-voice').value = settings.voice || 'kavya';
+    document.getElementById('confirmation-script').value = settings.script || '';
+    status.textContent = settings.enabled ? '● Calling is enabled' : '● Calling is disabled';
+    status.style.color = settings.enabled ? 'var(--green)' : 'var(--muted)';
+    await loadConfirmationContacts();
+    await loadManualAppointments();
+  }} catch(e) {{ confirmationError(e.message); }}
+}}
+
+async function saveConfirmationSettings() {{
+  const status = document.getElementById('confirmation-save-status');
+  status.textContent = 'Saving…';
+  status.style.color = 'var(--muted)';
+  try {{
+    const settings = await confirmationRequest('/api/confirmation/settings', {{
+      method: 'PUT', headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{
+        enabled: document.getElementById('confirmation-enabled').checked,
+        lead_hours: Number(document.getElementById('confirmation-lead-hours').value),
+        max_attempts: Number(document.getElementById('confirmation-max-attempts').value),
+        call_window_start: document.getElementById('confirmation-window-start').value,
+        call_window_end: document.getElementById('confirmation-window-end').value,
+        retry_delay_minutes: Number(document.getElementById('confirmation-retry-delay').value),
+        language: document.getElementById('confirmation-language').value,
+        voice: document.getElementById('confirmation-voice').value,
+        script: document.getElementById('confirmation-script').value,
+      }})
+    }});
+    status.textContent = settings.enabled ? '✅ Saved — calls are enabled' : '✅ Saved — calls remain disabled';
+    status.style.color = 'var(--green)';
+  }} catch(e) {{ confirmationError(e.message); }}
+}}
+
+function confirmationEscape(value) {{
+  return String(value || '').replace(/[&<>'"]/g, char => ({{
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'
+  }}[char]));
+}}
+
+async function loadConfirmationContacts() {{
+  const list = document.getElementById('confirmation-contact-list');
+  list.innerHTML = '<div class="hint">Loading do-not-call contacts…</div>';
+  try {{
+    const contacts = await confirmationRequest('/api/confirmation/contacts');
+    const optedOut = contacts.filter(contact => !contact.confirmation_enabled);
+    if (!optedOut.length) {{
+      list.innerHTML = '<div class="hint">No contacts are excluded from confirmation calls.</div>';
+      return;
+    }}
+    list.innerHTML = optedOut.map(contact => `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
+        <div><div style="font-family:monospace;font-size:12px;">${{confirmationEscape(contact.patient_phone)}}</div><div class="hint">${{confirmationEscape(contact.opt_out_reason || 'Do not call')}}</div></div>
+        <button class="btn btn-ghost btn-sm" onclick="allowConfirmationCalls('${{confirmationEscape(contact.patient_phone)}}')">Remove</button>
+      </div>`).join('');
+  }} catch(e) {{ list.innerHTML = '<div class="hint" style="color:var(--red)">Could not load contacts: ' + confirmationEscape(e.message) + '</div>'; }}
+}}
+
+async function addConfirmationOptOut() {{
+  const phone = document.getElementById('confirmation-optout-phone').value.trim();
+  const reason = document.getElementById('confirmation-optout-reason').value.trim();
+  if (!phone) {{ confirmationError('Enter a phone number first.'); return; }}
+  try {{
+    await confirmationRequest('/api/confirmation/contacts/' + encodeURIComponent(phone), {{
+      method: 'PUT', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify({{enabled:false, reason}})
+    }});
+    document.getElementById('confirmation-optout-phone').value = '';
+    document.getElementById('confirmation-optout-reason').value = '';
+    await loadConfirmationContacts();
+  }} catch(e) {{ confirmationError(e.message); }}
+}}
+
+async function allowConfirmationCalls(phone) {{
+  try {{
+    await confirmationRequest('/api/confirmation/contacts/' + encodeURIComponent(phone), {{
+      method: 'PUT', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify({{enabled:true}})
+    }});
+    await loadConfirmationContacts();
+  }} catch(e) {{ confirmationError(e.message); }}
+}}
+
+function formatConfirmationDate(iso) {{
+  if (!iso) return '24-hour rule';
+  return new Date(iso).toLocaleString('en-IN', {{ timeZone:'Asia/Kolkata', dateStyle:'medium', timeStyle:'short' }});
+}}
+
+async function loadManualAppointments() {{
+  const list = document.getElementById('manual-appointment-list');
+  list.innerHTML = '<div class="hint">Loading manual appointments…</div>';
+  try {{
+    const appointments = await confirmationRequest('/api/confirmation/appointments');
+    if (!appointments.length) {{
+      list.innerHTML = '<div class="hint">No manual appointments added.</div>';
+      return;
+    }}
+    list.innerHTML = appointments.map(appointment => `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);">
+        <div><div style="font-weight:600;">${{confirmationEscape(appointment.patient_name || appointment.patient_phone)}}</div><div class="hint">📅 ${{formatConfirmationDate(appointment.starts_at)}} · 📞 ${{confirmationEscape(appointment.patient_phone)}}<br>Confirmation: ${{formatConfirmationDate(appointment.confirmation_call_at)}}</div></div>
+        <button class="btn btn-ghost btn-sm" onclick="removeManualAppointment('${{appointment.id}}')">Remove</button>
+      </div>`).join('');
+  }} catch(e) {{ list.innerHTML = '<div class="hint" style="color:var(--red)">Run the manual-appointments SQL migration, then reopen this popup.</div>'; }}
+}}
+
+async function addManualAppointment() {{
+  const data = {{
+    patient_name: document.getElementById('manual-appointment-name').value.trim(),
+    patient_phone: document.getElementById('manual-appointment-phone').value.trim(),
+    starts_at: document.getElementById('manual-appointment-time').value,
+    confirmation_call_at: document.getElementById('manual-confirmation-time').value,
+    notes: document.getElementById('manual-appointment-notes').value.trim(),
+  }};
+  if (!data.patient_phone || !data.starts_at) {{ confirmationError('Phone number and appointment time are required.'); return; }}
+  try {{
+    await confirmationRequest('/api/confirmation/appointments', {{
+      method: 'POST', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify(data)
+    }});
+    ['manual-appointment-name','manual-appointment-phone','manual-appointment-time','manual-confirmation-time','manual-appointment-notes'].forEach(id => document.getElementById(id).value = '');
+    await loadManualAppointments();
+  }} catch(e) {{ confirmationError(e.message); }}
+}}
+
+async function removeManualAppointment(id) {{
+  if (!confirm('Remove this manual appointment?')) return;
+  try {{
+    await confirmationRequest('/api/confirmation/appointments/' + encodeURIComponent(id), {{method:'DELETE'}});
+    await loadManualAppointments();
+  }} catch(e) {{ confirmationError(e.message); }}
+}}
+
 // ── CRM ─────────────────────────────────────────────────────────────────────
 async function loadCRM() {{
   const tbody = document.getElementById('crm-tbody');
   if (!tbody) return;
-  tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:32px;color:var(--muted);">Loading contacts...</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:32px;color:var(--muted);">Loading contacts...</td></tr>';
   try {{
-    const contacts = await fetch('/api/contacts').then(r => r.json());
+    const [contacts, preferences] = await Promise.all([
+      fetch('/api/contacts').then(r => r.json()),
+      confirmationRequest('/api/confirmation/contacts').catch(() => [])
+    ]);
+    const optedOut = new Set(preferences.filter(p => !p.confirmation_enabled).map(p => p.patient_phone));
     if (!contacts.length) {{
-      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:40px;color:var(--muted);">No contacts yet. They will appear here automatically after calls.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--muted);">No contacts yet. They will appear here automatically after calls.</td></tr>';
       return;
     }}
     tbody.innerHTML = contacts.map(c => `
@@ -1203,10 +1510,23 @@ async function loadCRM() {{
         <td style="padding:14px 16px;">${{c.is_booked
           ? '<span class="badge badge-green">✅ Booked</span>'
           : '<span class="badge badge-gray">📵 No booking</span>'}}</td>
+        <td style="padding:14px 16px;">${{optedOut.has(c.phone_number)
+          ? `<button class="btn btn-ghost btn-sm" onclick="setCRMConfirmation('${{c.phone_number}}', true)">🚫 Excluded — Remove</button>`
+          : `<button class="btn btn-ghost btn-sm" onclick="setCRMConfirmation('${{c.phone_number}}', false)">🚫 Exclude</button>`}}</td>
       </tr>`).join('');
   }} catch(e) {{
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:24px;color:#ef4444;">Error loading contacts. Check Supabase credentials.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:24px;color:#ef4444;">Error loading contacts. Check Supabase credentials.</td></tr>';
   }}
+}}
+
+async function setCRMConfirmation(phone, enabled) {{
+  if (!phone || phone === '—') return;
+  try {{
+    await confirmationRequest('/api/confirmation/contacts/' + encodeURIComponent(phone), {{
+      method: 'PUT', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify({{enabled}})
+    }});
+    await loadCRM();
+  }} catch(e) {{ alert('Could not update confirmation preference: ' + e.message); }}
 }}
 
 // ── Save Config ─────────────────────────────────────────────────────────────
