@@ -9,7 +9,7 @@ from datetime import datetime
 import certifi
 from dotenv import load_dotenv
 from livekit.agents import Agent, AgentSession, JobContext, RoomInputOptions, WorkerOptions, cli, llm
-from livekit.plugins import openai, sarvam
+from livekit.plugins import openai, sarvam, silero
 
 from confirmation_store import get_settings
 from notify import send_telegram
@@ -143,12 +143,15 @@ async def entrypoint(ctx: JobContext):
     agent_stt = sarvam.STT(language="unknown", model="saaras:v3", mode="translate", flush_signal=True, sample_rate=16000)
     agent_llm = openai.LLM(model=os.getenv("LLM_MODEL", "gpt-4o-mini"), max_completion_tokens=100)
     agent_tts = sarvam.TTS(target_language_code=language, model="bulbul:v3", speaker=voice, speech_sample_rate=24000)
+    agent_vad = silero.VAD.load(min_silence_duration=0.4)
+    logger.info("[VAD] Silero enabled; min_silence_duration=0.40s")
     session = AgentSession(
         stt=agent_stt,
         llm=agent_llm,
         tts=agent_tts,
-        turn_detection="stt",
-        min_endpointing_delay=0.3,
+        vad=agent_vad,
+        turn_detection="vad",
+        min_endpointing_delay=0.25,
         max_endpointing_delay=1.5,
         allow_interruptions=True,
     )

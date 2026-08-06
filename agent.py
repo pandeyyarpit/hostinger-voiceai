@@ -429,7 +429,13 @@ class OutboundAssistant(Agent):
             "Do not ask for the email again, re-check availability, or offer other slots after the caller has confirmed a listed slot. "
             "Never say a booking is confirmed before the tool returns success. If it succeeds, say it is confirmed; if it fails, offer only the alternatives returned by the tool."
         )
-        final_instructions = base_instructions + ist_context + lang_instruction + booking_instruction
+        voice_speed_instruction = (
+            "\n\n[VOICE SPEED — STRICT]\n"
+            "Use exactly one concise spoken sentence per turn, normally under 18 words. "
+            "Do not add filler words, repeated acknowledgements, or a second explanation. "
+            "Only list multiple times when the caller explicitly asks for available slots."
+        )
+        final_instructions = base_instructions + ist_context + lang_instruction + booking_instruction + voice_speed_instruction
 
         # Token counter (#11)
         token_count = count_tokens(final_instructions)
@@ -503,7 +509,7 @@ async def entrypoint(ctx: JobContext):
 
     # ── Load config ───────────────────────────────────────────────────────
     live_config   = get_live_config(caller_phone)
-    delay_setting = live_config.get("stt_min_endpointing_delay", 0.05)
+    delay_setting = live_config.get("stt_min_endpointing_delay", 0.25)
     llm_model     = live_config.get("llm_model", "gpt-4o-mini")
     llm_provider  = live_config.get("llm_provider", "openai")
     tts_voice     = live_config.get("tts_voice", "kavya")
@@ -633,11 +639,6 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info(f"[TTS] Using Sarvam Bulbul v3 — voice: {tts_voice} lang: {tts_language}")
 
-    # ── Sentence chunker (keep responses short for voice) ─────────────────
-    def before_tts_cb(agent_response: str) -> str:
-        sentences = re.split(r'(?<=[।.!?])\s+', agent_response.strip())
-        return sentences[0] if sentences else agent_response
-
     # ── Turn counter + auto-close (#29) ──────────────────────────────────
     turn_count    = 0
     interrupt_count = 0  # (#30)
@@ -665,12 +666,19 @@ async def entrypoint(ctx: JobContext):
         except Exception:
             room_input = RoomInputOptions(close_on_disconnect=False)
 
+    # Detect the end of speech locally instead of waiting for Sarvam STT's
+    # server-side endpoint signal, which is the largest observed pause.
+    vad_silence = float(live_config.get("vad_min_silence_duration", 0.4))
+    agent_vad = silero.VAD.load(min_silence_duration=vad_silence)
+    logger.info("[VAD] Silero enabled; min_silence_duration=%.2fs", vad_silence)
+
     session = AgentSession(
         stt=agent_stt,
         llm=agent_llm,
         tts=agent_tts,
-        turn_detection="stt",
-        min_endpointing_delay=float(delay_setting),  # 0.05 default (#6)
+        vad=agent_vad,
+        turn_detection="vad",
+        min_endpointing_delay=max(0.25, float(delay_setting)),
         max_endpointing_delay=float(live_config.get("stt_max_endpointing_delay", 1.5)),
         allow_interruptions=True,
     )
