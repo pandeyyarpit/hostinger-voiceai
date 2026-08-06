@@ -168,6 +168,6 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    # The inbound worker uses LiveKit's default health/metrics port 8081.
+    # The inbound worker uses LiveKit's default health-server port 8081.
     # This second worker must use a different internal port in the same container.
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="confirmation-caller", prometheus_port=8082))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name="confirmation-caller", port=8082))
