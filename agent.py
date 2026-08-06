@@ -49,6 +49,42 @@ from livekit.plugins import openai, sarvam, silero
 
 CONFIG_FILE = "config.json"
 
+
+def attach_latency_logging(room_name: str, agent_stt, agent_llm, agent_tts) -> None:
+    """Write per-stage inference timings to the worker log without caller content."""
+
+    def log_stt(metric) -> None:
+        logger.info(
+            "[LATENCY] room=%s stage=stt request=%.2fs audio=%.2fs streamed=%s",
+            room_name,
+            getattr(metric, "duration", 0.0),
+            getattr(metric, "audio_duration", 0.0),
+            getattr(metric, "streamed", False),
+        )
+
+    def log_llm(metric) -> None:
+        logger.info(
+            "[LATENCY] room=%s stage=llm ttft=%.2fs total=%.2fs tokens_per_second=%.1f",
+            room_name,
+            getattr(metric, "ttft", 0.0),
+            getattr(metric, "duration", 0.0),
+            getattr(metric, "tokens_per_second", 0.0),
+        )
+
+    def log_tts(metric) -> None:
+        logger.info(
+            "[LATENCY] room=%s stage=tts ttfb=%.2fs total=%.2fs audio=%.2fs streamed=%s",
+            room_name,
+            getattr(metric, "ttfb", 0.0),
+            getattr(metric, "duration", 0.0),
+            getattr(metric, "audio_duration", 0.0),
+            getattr(metric, "streamed", False),
+        )
+
+    agent_stt.on("metrics_collected", log_stt)
+    agent_llm.on("metrics_collected", log_llm)
+    agent_tts.on("metrics_collected", log_tts)
+
 # ── Rate limiting (#37) ───────────────────────────────────────────────────────
 _call_timestamps: dict = defaultdict(list)
 RATE_LIMIT_CALLS  = 5
@@ -635,8 +671,11 @@ async def entrypoint(ctx: JobContext):
         tts=agent_tts,
         turn_detection="stt",
         min_endpointing_delay=float(delay_setting),  # 0.05 default (#6)
+        max_endpointing_delay=float(live_config.get("stt_max_endpointing_delay", 1.5)),
         allow_interruptions=True,
     )
+
+    attach_latency_logging(ctx.room.name, agent_stt, agent_llm, agent_tts)
 
     await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
 

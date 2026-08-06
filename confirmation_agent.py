@@ -24,6 +24,25 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("confirmation-agent")
 
 
+def attach_latency_logging(room_name: str, agent_stt, agent_llm, agent_tts) -> None:
+    """Write per-stage inference timings to the worker log without caller content."""
+
+    def log_metric(stage: str, metric) -> None:
+        logger.info(
+            "[LATENCY] room=%s stage=%s stt=%.2fs llm_ttft=%.2fs tts_ttfb=%.2fs total=%.2fs",
+            room_name,
+            stage,
+            getattr(metric, "duration", 0.0) if stage == "stt" else 0.0,
+            getattr(metric, "ttft", 0.0),
+            getattr(metric, "ttfb", 0.0),
+            getattr(metric, "duration", 0.0),
+        )
+
+    agent_stt.on("metrics_collected", lambda metric: log_metric("stt", metric))
+    agent_llm.on("metrics_collected", lambda metric: log_metric("llm", metric))
+    agent_tts.on("metrics_collected", lambda metric: log_metric("tts", metric))
+
+
 class ConfirmationTools(llm.ToolContext):
     def __init__(self, job_ctx: JobContext, room_name: str, metadata: dict):
         super().__init__(tools=[])
@@ -121,14 +140,19 @@ async def entrypoint(ctx: JobContext):
         metadata.get("appointment_time", ""),
         settings.get("script", ""),
     )
+    agent_stt = sarvam.STT(language="unknown", model="saaras:v3", mode="translate", flush_signal=True, sample_rate=16000)
+    agent_llm = openai.LLM(model=os.getenv("LLM_MODEL", "gpt-4o-mini"), max_completion_tokens=100)
+    agent_tts = sarvam.TTS(target_language_code=language, model="bulbul:v3", speaker=voice, speech_sample_rate=24000)
     session = AgentSession(
-        stt=sarvam.STT(language="unknown", model="saaras:v3", mode="translate", flush_signal=True, sample_rate=16000),
-        llm=openai.LLM(model=os.getenv("LLM_MODEL", "gpt-4o-mini"), max_completion_tokens=100),
-        tts=sarvam.TTS(target_language_code=language, model="bulbul:v3", speaker=voice, speech_sample_rate=24000),
+        stt=agent_stt,
+        llm=agent_llm,
+        tts=agent_tts,
         turn_detection="stt",
         min_endpointing_delay=0.3,
+        max_endpointing_delay=1.5,
         allow_interruptions=True,
     )
+    attach_latency_logging(ctx.room.name, agent_stt, agent_llm, agent_tts)
     await session.start(room=ctx.room, agent=agent, room_input_options=RoomInputOptions(close_on_disconnect=False))
 
     async def expire_unanswered_call():
