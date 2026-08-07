@@ -143,8 +143,14 @@ async def entrypoint(ctx: JobContext):
     agent_stt = sarvam.STT(language="unknown", model="saaras:v3", mode="translate", flush_signal=True, sample_rate=16000)
     agent_llm = openai.LLM(model=os.getenv("LLM_MODEL", "gpt-4o-mini"), max_completion_tokens=100)
     agent_tts = sarvam.TTS(target_language_code=language, model="bulbul:v3", speaker=voice, speech_sample_rate=24000)
-    agent_vad = silero.VAD.load(min_silence_duration=0.4)
-    logger.info("[VAD] Silero enabled; min_silence_duration=0.40s")
+    # Match the inbound agent's noise-resistant settings so ambient sounds do
+    # not trigger confirmation-call turns or interrupt the agent.
+    agent_vad = silero.VAD.load(
+        min_silence_duration=0.4,
+        min_speech_duration=0.15,
+        activation_threshold=0.65,
+    )
+    logger.info("[VAD] Silero enabled; threshold=0.65 min_speech=0.15s min_silence=0.40s")
     session = AgentSession(
         stt=agent_stt,
         llm=agent_llm,

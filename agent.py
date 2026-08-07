@@ -719,9 +719,23 @@ async def entrypoint(ctx: JobContext):
 
     # Detect the end of speech locally instead of waiting for Sarvam STT's
     # server-side endpoint signal, which is the largest observed pause.
+    # Phone calls often contain fan noise, nearby conversations, and line hiss.
+    # Require a stronger and slightly longer speech signal before treating it as
+    # caller speech, so those sounds do not interrupt the agent or create turns.
     vad_silence = float(live_config.get("vad_min_silence_duration", 0.4))
-    agent_vad = silero.VAD.load(min_silence_duration=vad_silence)
-    logger.info("[VAD] Silero enabled; min_silence_duration=%.2fs", vad_silence)
+    vad_threshold = float(live_config.get("vad_activation_threshold", 0.65))
+    vad_min_speech = float(live_config.get("vad_min_speech_duration", 0.15))
+    agent_vad = silero.VAD.load(
+        min_silence_duration=vad_silence,
+        min_speech_duration=vad_min_speech,
+        activation_threshold=vad_threshold,
+    )
+    logger.info(
+        "[VAD] Silero enabled; threshold=%.2f min_speech=%.2fs min_silence=%.2fs",
+        vad_threshold,
+        vad_min_speech,
+        vad_silence,
+    )
 
     session = AgentSession(
         stt=agent_stt,
