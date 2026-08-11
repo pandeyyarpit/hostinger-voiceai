@@ -146,6 +146,26 @@ def notify_booking_cancelled(
     return send_telegram(message)
 
 
+def notify_booking_cancellation_verification_failed(
+    caller_name: str,
+    caller_phone: str,
+    supplied_name: str,
+    reason: str,
+) -> bool:
+    """Alert staff whenever a cancellation is deliberately blocked for safety."""
+    message = (
+        f"⚠️ *Cancellation Blocked — Verification Failed*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📞 *Caller phone:* `{caller_phone}`\n"
+        f"👤 *CRM name:* {caller_name or 'No matching record'}\n"
+        f"🗣️ *Name supplied:* {supplied_name or '—'}\n"
+        f"💬 *Reason:* {reason}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_No Cal.com booking was cancelled._"
+    )
+    return send_telegram(message)
+
+
 def notify_booking_failed(
     caller_name: str,
     caller_phone: str,

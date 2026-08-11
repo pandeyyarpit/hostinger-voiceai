@@ -202,6 +202,7 @@ from notify import (
     notify_booking_confirmed,
     notify_booking_failed,
     notify_booking_cancelled,
+    notify_booking_cancellation_verification_failed,
     notify_call_no_booking,
     notify_agent_error,
 )
@@ -221,6 +222,7 @@ class AgentTools(llm.ToolContext):
         self.booking_result: dict | None = None
         self.booking_notification_sent = False
         self.last_booking_failure: dict | None = None
+        self.cancellation_result: dict | None = None
         self.sip_domain          = os.getenv("VOBIZ_SIP_DOMAIN")
         self.ctx_api             = None
         self.job_ctx             = None
@@ -229,6 +231,71 @@ class AgentTools(llm.ToolContext):
         self.session             = None
         self._end_task           = None
         self._closure_idle_task  = None
+        self._booking_notification_task = None
+        self._cancellation_notification_task = None
+
+    @staticmethod
+    def _normalise_first_name(value: str) -> str:
+        """Compare a first name to a caller's letter-by-letter spelling.
+
+        ``str.isalnum`` deliberately keeps Indian-language characters while
+        ignoring spaces, punctuation, and letter-by-letter pauses.
+        """
+        return "".join(character for character in (value or "").casefold() if character.isalnum())
+
+    @classmethod
+    def _first_name_from_full_name(cls, name: str) -> str:
+        parts = [part for part in (name or "").strip().split() if part]
+        if not parts:
+            return ""
+        # Speech-to-text may preserve a letter-spelled one-word name as
+        # ``R I T I K``. Treat that as one name rather than just ``R``.
+        if len(parts) > 1 and all(len(cls._normalise_first_name(part)) == 1 for part in parts):
+            return "".join(parts)
+        return parts[0]
+
+    async def _say_progress(self, text: str) -> None:
+        """Give a short audible status update without adding it to the LLM chat."""
+        if not self.session:
+            return
+        try:
+            await asyncio.wait_for(
+                self.session.say(text, allow_interruptions=True, add_to_chat_ctx=False),
+                timeout=3,
+            )
+        except Exception as e:
+            # A progress line is helpful but must never prevent the real
+            # calendar operation from completing.
+            logger.debug("[VOICE] Progress prompt skipped: %s", e)
+
+    async def _wait_with_progress(self, operation, first_message: str, slow_message: str):
+        """Run external work without leaving the caller in unexplained silence."""
+        task = asyncio.create_task(operation)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=0.35)
+        except asyncio.TimeoutError:
+            await self._say_progress(first_message)
+
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=4.0)
+        except asyncio.TimeoutError:
+            await self._say_progress(slow_message)
+        return await task
+
+    async def _deliver_booking_notification(self, **details) -> bool:
+        """Deliver notices in the background so confirmation speech is immediate."""
+        try:
+            return bool(await asyncio.to_thread(notify_booking_confirmed, **details))
+        except Exception as e:
+            logger.error("[TELEGRAM] Booking notification task failed: %s", e)
+            return False
+
+    async def _deliver_cancellation_notification(self, **details) -> bool:
+        try:
+            return bool(await asyncio.to_thread(notify_booking_cancelled, **details))
+        except Exception as e:
+            logger.error("[TELEGRAM] Cancellation notification task failed: %s", e)
+            return False
 
     # ── Tool: Transfer to Human ───────────────────────────────────────────
     @llm.function_tool(description="Transfer this call to a human agent. Use if: caller asks for human, is angry, or query is outside scope.")
@@ -325,13 +392,15 @@ class AgentTools(llm.ToolContext):
             logger.warning(f"[END-CALL] Closing idle fallback failed: {e}")
 
     # ── Tool: Save Booking Intent ─────────────────────────────────────────
-    @llm.function_tool(description="Create the Cal.com appointment immediately after caller confirms a slot and provides name/email. Call this ONCE with the exact ISO slot. It returns the real booking result.")
+    @llm.function_tool(description="Create the Cal.com appointment only after the caller has spelled their first name, spelled their email including at and dot, heard both details repeated back, and clearly said yes to booking the exact ISO slot. Call this ONCE. It returns the real booking result.")
     async def save_booking_intent(
         self,
         start_time:   Annotated[str,  "ISO 8601 datetime e.g. '2026-03-01T10:00:00+05:30'"],
-        caller_name:  Annotated[str,  "Full name of the caller"],
+        caller_name:  Annotated[str,  "Full name stated by the caller before spelling verification"],
+        spelled_first_name: Annotated[str, "First name exactly as the caller spelled it letter by letter"],
+        caller_email: Annotated[str,  "Email exactly as the caller spelled it, including at and dot"],
+        booking_confirmed: Annotated[bool, "True only after repeating the verified name and email and the caller clearly says yes"],
         caller_phone: Annotated[str,  "Phone number of the caller; omit when it is already known from the call" ] = "",
-        caller_email: Annotated[str,  "Email address of the caller as spoken on the call" ] = "",
         notes:        Annotated[str,  "Any additional notes or special requests"] = "",
     ) -> str:
         caller_phone = caller_phone.strip() or self.caller_phone
@@ -339,22 +408,27 @@ class AgentTools(llm.ToolContext):
         logger.info(f"[TOOL] save_booking_intent: {caller_name} at {start_time}, email={caller_email}")
         if not caller_phone or caller_phone == "unknown":
             return "I still need the caller's phone number before I can save the appointment."
-        if caller_email and not is_valid_email(caller_email):
+        expected_first_name = self._normalise_first_name(self._first_name_from_full_name(caller_name))
+        spelled_name = self._normalise_first_name(spelled_first_name)
+        if not expected_first_name or not spelled_name:
             return (
-                "The email address is invalid. Ask the caller to repeat it slowly, letter by letter, "
-                "then call save_booking_intent again. Do not save or confirm the appointment yet."
+                "I still need the caller to spell their first name letter by letter. "
+                "Ask them to spell it, repeat it back, and do not save the appointment yet."
             )
-        available, alternatives = is_slot_available(start_time)
-        if not available:
-            suggestions = ", ".join(alternatives[:6])
-            if suggestions:
-                return (
-                    f"That requested time is not available. Offer the caller one of these available times: "
-                    f"{suggestions} IST. Do not say the appointment is booked."
-                )
+        if expected_first_name != spelled_name:
             return (
-                "I could not validate that requested time with the calendar. Ask the caller to choose "
-                "another time or try again later. Do not say the appointment is booked."
+                "The spelled first name does not match the name provided. Ask the caller to state and spell "
+                "their first name again, then repeat it back. Do not save the appointment yet."
+            )
+        if not caller_email or not is_valid_email(caller_email):
+            return (
+                "The email address is missing or invalid. Ask the caller to spell it slowly, including at and dot, "
+                "then repeat it back. Do not save or confirm the appointment yet."
+            )
+        if not booking_confirmed:
+            return (
+                "Repeat the verified first name and email plus the appointment time, then ask for a clear yes. "
+                "Do not save or confirm the appointment until they say yes."
             )
         if self.booking_result and self.booking_result.get("success"):
             return "This appointment is already confirmed. Thank the caller and end the call."
@@ -370,15 +444,19 @@ class AgentTools(llm.ToolContext):
             # Create the booking while the caller is still connected. Previously
             # this only saved an intent and waited for shutdown, which allowed the
             # conversation to loop and left a gap between acknowledgement and Cal.com.
-            result = await async_create_booking(**intent)
+            result = await self._wait_with_progress(
+                async_create_booking(**intent),
+                "One moment, I am confirming that appointment now.",
+                "I am still confirming it with the calendar. Thank you for waiting.",
+            )
         except Exception as e:
             logger.error(f"[TOOL] Immediate booking failed: {e}")
             result = {"success": False, "booking_id": None, "message": str(e)}
 
         if not result.get("success"):
             self.last_booking_failure = {**intent, "message": result.get("message", "Booking failed")}
-            available_now, fresh_alternatives = is_slot_available(start_time)
-            suggestions = ", ".join((fresh_alternatives or alternatives)[:6])
+            _available_now, fresh_alternatives = await asyncio.to_thread(is_slot_available, start_time)
+            suggestions = ", ".join(fresh_alternatives[:6])
             if suggestions:
                 return (
                     f"The appointment was not created: {result.get('message', 'calendar rejected the slot')}. "
@@ -390,19 +468,89 @@ class AgentTools(llm.ToolContext):
         self.booking_result = result
         self.last_booking_failure = None
         self.caller_name = caller_name
-        notify_booking_confirmed(
+        # Telegram and WhatsApp can each take several seconds.  Deliver them
+        # in the background so the caller receives the Cal.com confirmation
+        # immediately, then await/retry the task safely during shutdown.
+        self._booking_notification_task = asyncio.create_task(self._deliver_booking_notification(
             caller_name=caller_name,
             caller_phone=caller_phone,
             booking_time_iso=start_time,
             booking_id=result.get("booking_id", "unknown"),
             notes=notes,
-        )
-        self.booking_notification_sent = True
+        ))
+        self.booking_notification_sent = False
         self._schedule_closure_idle(20)
         return (
             "The appointment is confirmed in Cal.com. Tell the caller exactly: "
             "'Your appointment is confirmed. Is there anything else I can help you with?' "
             "Do not call end_call until the caller clearly closes the conversation."
+        )
+
+    # ── Tool: Verified Cancellation ──────────────────────────────────────
+    @llm.function_tool(
+        description=(
+            "Cancel an existing appointment only after the caller explicitly asks to cancel AND gives "
+            "the full name used when booking. This tool cross-checks the live caller phone number and "
+            "the supplied name against the CRM. Call it once; never cancel without a successful match."
+        )
+    )
+    async def verify_and_cancel_booking(
+        self,
+        booked_name: Annotated[str, "Full name the caller says was used for the booking"],
+    ) -> str:
+        booked_name = (booked_name or "").strip()
+        logger.info("[TOOL] verify_and_cancel_booking requested for phone=%s name=%s", self.caller_phone, booked_name)
+        lookup = await self._wait_with_progress(
+            asyncio.to_thread(db.find_verified_booking_for_cancellation, self.caller_phone, booked_name),
+            "One moment, I am verifying that appointment now.",
+            "I am still checking the booking details. Thank you for waiting.",
+        )
+        if not lookup.get("success"):
+            reason = lookup.get("message", "Verification failed.")
+            self.cancellation_result = {"success": False, "reason": reason, "supplied_name": booked_name}
+            notify_booking_cancellation_verification_failed(
+                caller_name="",
+                caller_phone=self.caller_phone,
+                supplied_name=booked_name,
+                reason=reason,
+            )
+            return (
+                "Verification did not match an appointment, so nothing was cancelled. "
+                "Tell the caller you cannot cancel it until the booking name matches and that the team has been alerted."
+            )
+
+        booking = lookup["booking"]
+        result = await asyncio.to_thread(
+            cancel_booking, booking["booking_id"], "Cancelled by caller after name verification"
+        )
+        if not result.get("success"):
+            reason = result.get("message", "Cal.com rejected the cancellation.")
+            self.cancellation_result = {"success": False, "reason": reason, "booking_id": booking["booking_id"]}
+            notify_booking_cancellation_verification_failed(
+                caller_name=booking.get("caller_name", ""),
+                caller_phone=self.caller_phone,
+                supplied_name=booked_name,
+                reason=f"Cal.com cancellation failed: {reason}",
+            )
+            return "The appointment was not cancelled. Apologize, say the team has been alerted, and do not claim success."
+
+        crm_updated = await asyncio.to_thread(db.mark_booking_cancelled, booking["id"], booking["booking_id"])
+        self.cancellation_result = {
+            "success": True,
+            "booking_id": booking["booking_id"],
+            "caller_name": booking.get("caller_name", ""),
+            "crm_updated": crm_updated,
+        }
+        self._cancellation_notification_task = asyncio.create_task(self._deliver_cancellation_notification(
+            caller_name=booking.get("caller_name", "") or booked_name,
+            caller_phone=self.caller_phone,
+            booking_id=booking["booking_id"],
+            reason="Caller verified booking name",
+        ))
+        self._schedule_closure_idle(20)
+        return (
+            "The appointment was cancelled in Cal.com. Tell the caller exactly: "
+            "'Your appointment has been cancelled. Is there anything else I can help you with?'"
         )
 
     # ── Tool: Check Availability (#13) ────────────────────────────────────
@@ -413,7 +561,11 @@ class AgentTools(llm.ToolContext):
     ) -> str:
         logger.info(f"[TOOL] check_availability: date={date}")
         try:
-            slots = get_available_slots(date)  # FIX: sync function, no await
+            slots = await self._wait_with_progress(
+                asyncio.to_thread(get_available_slots, date),
+                "One moment, I am checking the available times.",
+                "I am still checking the calendar. Thank you for waiting.",
+            )
             if not slots:
                 return f"No available slots on {date}. Would you like to check another date?"
             slot_strings = [s.get("label", s.get("time", str(s))) for s in slots[:6]]  # FIX: correct key
@@ -463,12 +615,20 @@ class OutboundAssistant(Agent):
         lang_instruction  = get_language_instruction(lang_preset)
         booking_instruction = (
             "\n\n[BOOKING ACTION — STRICT]\n"
-            "When the caller agrees to an appointment date and time, collect their name and ask for their email. "
-            "As soon as the caller gives a final listed slot, name, and valid email, you MUST call save_booking_intent during the active call. "
-            "Pass the confirmed ISO date/time and the caller's name. The caller's phone number is already known for outbound calls, "
-            "so you may omit caller_phone unless the caller gives a different number. Email is optional if the caller declines it. "
-            "Do not ask for the email again, re-check availability, or offer other slots after the caller has confirmed a listed slot. "
+            "When the caller agrees to an appointment date and time: first collect their full name; then ask them to spell their FIRST NAME letter by letter; "
+            "then ask them to spell their email slowly, including at and dot. Email is required for every booking. "
+            "Repeat the verified first name, full email, and selected time back to the caller, and ask: 'Shall I book this appointment?' "
+            "Only after a clear yes may you call save_booking_intent during the active call. Pass the normal full name, the separately spelled first name, "
+            "the spelled email, and booking_confirmed=true. The caller's phone number is already known for inbound calls, so omit it unless changed. "
+            "Never use a guessed name, a guessed email, a placeholder email, or booking_confirmed=true before that final yes. "
+            "Do not re-check availability or offer other slots after the caller has confirmed a listed slot. "
             "Never say a booking is confirmed before the tool returns success. If it succeeds, say it is confirmed; if it fails, offer only the alternatives returned by the tool."
+        )
+        cancellation_instruction = (
+            "\n\n[CANCELLATION — STRICT]\n"
+            "If a caller wants to cancel, first ask for the full name used for the booking. "
+            "After they give it, call verify_and_cancel_booking exactly once. Never say it is cancelled before that tool reports success. "
+            "If verification fails, do not retry with guesses or ask for a different name; explain that the team will help."
         )
         closing_instruction = (
             "\n\n[CALL CLOSING — STRICT]\n"
@@ -484,7 +644,7 @@ class OutboundAssistant(Agent):
             "Only list multiple times when the caller explicitly asks for available slots."
         )
         final_instructions = (
-            base_instructions + ist_context + lang_instruction + booking_instruction
+            base_instructions + ist_context + lang_instruction + booking_instruction + cancellation_instruction
             + closing_instruction + voice_speed_instruction
         )
 
@@ -504,9 +664,9 @@ class OutboundAssistant(Agent):
                 "Hmm, may I ask what kind of business you run?"
             )
         )
-        await self.session.generate_reply(
-            instructions=f"Say exactly this phrase: '{greeting}'"
-        )
+        # The greeting is static. Going through the LLM here added its full
+        # time-to-first-token before callers heard anything.
+        await self.session.say(greeting, allow_interruptions=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -915,7 +1075,13 @@ async def entrypoint(ctx: JobContext):
         # Booking
         booking_status_msg = "No booking"
         booking_succeeded = False
-        if agent_tools.booking_intent:
+        if agent_tools.cancellation_result:
+            cancellation = agent_tools.cancellation_result
+            if cancellation.get("success"):
+                booking_status_msg = f"Booking Cancelled: {cancellation.get('booking_id', 'unknown')}"
+            else:
+                booking_status_msg = f"Cancellation Not Completed: {cancellation.get('reason', 'verification failed')}"
+        elif agent_tools.booking_intent:
             intent = agent_tools.booking_intent
             # Normal path: the transaction already completed in the tool while
             # the caller was connected. Keep the fallback for older in-flight jobs.
@@ -929,8 +1095,17 @@ async def entrypoint(ctx: JobContext):
                     notes=intent.get("notes", ""),
                 )
             if result.get("success"):
+                if agent_tools._booking_notification_task:
+                    try:
+                        agent_tools.booking_notification_sent = bool(
+                            await asyncio.shield(agent_tools._booking_notification_task)
+                        )
+                    except Exception as e:
+                        logger.error("[TELEGRAM] Background booking notification failed: %s", e)
+                        agent_tools.booking_notification_sent = False
                 if not agent_tools.booking_notification_sent:
-                    notify_booking_confirmed(
+                    agent_tools.booking_notification_sent = await asyncio.to_thread(
+                        notify_booking_confirmed,
                         caller_name=intent["caller_name"],
                         caller_phone=intent["caller_phone"],
                         booking_time_iso=intent["start_time"],

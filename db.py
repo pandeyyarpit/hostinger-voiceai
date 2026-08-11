@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import re
 from supabase import create_client, Client
 
 logger = logging.getLogger("db")
@@ -181,6 +182,78 @@ def fetch_bookings() -> list:
     except Exception as e:
         logger.error(f"Failed to fetch bookings: {e}")
         return []
+
+
+# ─── Verified cancellation lookup ────────────────────────────────────────────
+
+def _normalise_phone_for_match(phone: str) -> str:
+    """Compare Indian caller IDs safely even when one side has +91/leading 0."""
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-10:]
+
+
+def _normalise_name_for_match(name: str) -> str:
+    """Case/spacing/punctuation-insensitive, but deliberately not fuzzy."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def find_verified_booking_for_cancellation(caller_phone: str, booked_name: str) -> dict:
+    """Return one active CRM booking only when caller ID and booked name match.
+
+    Failing closed is intentional: no CRM record, name mismatch, or more than
+    one possible appointment must never result in a cancellation.
+    """
+    supplied_name = _normalise_name_for_match(booked_name)
+    caller_digits = _normalise_phone_for_match(caller_phone)
+    if not supplied_name or not caller_digits:
+        return {"success": False, "message": "A booked name and caller phone number are required."}
+
+    supabase = get_supabase()
+    if not supabase:
+        return {"success": False, "message": "CRM is unavailable; cancellation was not attempted."}
+
+    try:
+        rows = (
+            supabase.table("call_logs")
+            .select("id, phone_number, caller_name, summary, created_at")
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+        ).data or []
+    except Exception as e:
+        logger.error("Failed to look up booking for cancellation: %s", e)
+        return {"success": False, "message": "CRM lookup failed; cancellation was not attempted."}
+
+    matches = []
+    for row in rows:
+        if _normalise_phone_for_match(row.get("phone_number", "")) != caller_digits:
+            continue
+        if _normalise_name_for_match(row.get("caller_name", "")) != supplied_name:
+            continue
+        summary = row.get("summary", "") or ""
+        booking_match = re.search(r"Booking Confirmed:\s*([^\s]+)", summary, re.IGNORECASE)
+        if booking_match:
+            matches.append({**row, "booking_id": booking_match.group(1)})
+
+    if not matches:
+        return {"success": False, "message": "No active appointment matched that name and phone number."}
+    if len(matches) > 1:
+        return {"success": False, "message": "More than one appointment matched; team review is required."}
+    return {"success": True, "booking": matches[0]}
+
+
+def mark_booking_cancelled(call_log_id: str, booking_id: str) -> bool:
+    """Update the original booking record so it cannot be cancelled again."""
+    supabase = get_supabase()
+    if not supabase:
+        return False
+    try:
+        supabase.table("call_logs").update({"summary": f"Booking Cancelled: {booking_id}"}).eq("id", call_log_id).execute()
+        logger.info("Marked booking %s as cancelled in CRM", booking_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to mark booking cancelled in CRM: %s", e)
+        return False
 
 
 # ─── fetch_stats ──────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 import re
 import requests
@@ -7,7 +8,6 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("calendar-tools")
 
-CAL_BASE    = "https://api.cal.com/v1"
 CAL_V2_BASE = "https://api.cal.com/v2"
 # Cal.com currently versions the Slots and Bookings endpoints separately.
 CAL_SLOTS_API_VERSION = "2024-09-04"
@@ -28,8 +28,18 @@ def get_cal_creds() -> dict:
 
 
 def normalize_email(email: str) -> str:
-    """Convert a spelled-out email captured by speech-to-text into a usable value."""
-    return re.sub(r"\s+", "", (email or "")).lower()
+    """Convert a spoken or letter-spelled email into a usable address.
+
+    Examples handled here include ``r i t i k at gmail dot com`` and
+    ``ritik at the rate gmail dot com``.  This only normalizes the address;
+    the caller still has to hear it repeated back and explicitly approve it
+    before a booking can be created.
+    """
+    value = (email or "").strip().lower()
+    value = re.sub(r"\bat\s+the\s+rate\b", "@", value)
+    value = re.sub(r"\bat\b", "@", value)
+    value = re.sub(r"\b(?:dot|period)\b", ".", value)
+    return re.sub(r"\s+", "", value)
 
 
 def is_valid_email(email: str) -> bool:
@@ -100,7 +110,7 @@ def _get_slots_calcom(date_str: str) -> list:
                 "end":         end_utc,
                 "timeZone":    "Asia/Kolkata",
             },
-            timeout=8,
+            timeout=6,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -268,7 +278,10 @@ async def _create_booking_calcom(
 
     # Recheck immediately before creating the booking. The earlier check occurs
     # while collecting caller details, so its result can become stale.
-    available, _ = is_slot_available(start_time)
+    # ``is_slot_available`` uses the synchronous Cal.com slots endpoint.
+    # Keep that network wait off the voice-agent event loop so it can continue
+    # streaming TTS while the calendar is being checked.
+    available, _ = await asyncio.to_thread(is_slot_available, start_time)
     if not available:
         return {
             "success": False,
@@ -293,7 +306,10 @@ async def _create_booking_calcom(
         payload["bookingFieldsResponses"] = {"notes": notes}
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # A voice caller must not wait a full minute with no answer.  If this
+        # deadline is hit, reconciliation below checks whether Cal.com created
+        # the appointment before we ever report it as failed.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=3.0)) as client:
             resp = await client.post(
                 "https://api.cal.com/v2/bookings",
                 headers={
@@ -338,9 +354,9 @@ async def _find_booking_after_timeout(booking_start: str, event_type_id: int, at
 
     # Cal.com can finish processing immediately after the POST deadline, so
     # check a few times rather than issuing another create request.
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=2.0)) as client:
                 resp = await client.get(f"{CAL_V2_BASE}/bookings", headers=headers, params=params)
                 resp.raise_for_status()
                 bookings = resp.json().get("data", [])
@@ -360,9 +376,8 @@ async def _find_booking_after_timeout(booking_start: str, event_type_id: int, at
         except Exception as e:
             logger.warning(f"[CAL] Timeout reconciliation attempt {attempt + 1} failed: {e}")
 
-        if attempt < 2:
-            import asyncio
-            await asyncio.sleep(2)
+        if attempt < 1:
+            await asyncio.sleep(1)
     return None
 
 
@@ -409,13 +424,19 @@ async def _create_booking_gcal(
 # ─── Cancel a booking ──────────────────────────────────────────────────────────
 
 def cancel_booking(booking_id: str, reason: str = "Cancelled by caller") -> dict:
-    """Cancel a Cal.com booking by UID."""
+    """Cancel a Cal.com v2 booking by UID using the current API contract."""
     creds = get_cal_creds()
+    if not creds["api_key"]:
+        return {"success": False, "message": "Cal.com is not configured."}
     try:
-        resp = requests.delete(
-            f"{CAL_BASE}/bookings/{booking_id}/cancel?apiKey={creds['api_key']}",
-            headers={"Content-Type": "application/json"},
-            json={"reason": reason},
+        resp = requests.post(
+            f"{CAL_V2_BASE}/bookings/{booking_id}/cancel",
+            headers={
+                "Authorization": f"Bearer {creds['api_key']}",
+                "cal-api-version": CAL_BOOKINGS_API_VERSION,
+                "Content-Type": "application/json",
+            },
+            json={"cancellationReason": reason},
             timeout=8,
         )
         resp.raise_for_status()

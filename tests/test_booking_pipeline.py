@@ -33,6 +33,10 @@ class CalendarToolsTests(unittest.IsolatedAsyncioTestCase):
         email = calendar_tools.normalize_email("A R P I T 1 2 3@gmail.com")
         self.assertEqual(email, "arpit123@gmail.com")
         self.assertTrue(calendar_tools.is_valid_email(email))
+        self.assertEqual(
+            calendar_tools.normalize_email("R I T I K at the rate gmail dot com"),
+            "ritik@gmail.com",
+        )
         self.assertFalse(calendar_tools.is_valid_email("arpit123@gmail"))
 
     def test_ist_day_range_is_sent_to_calcom_in_utc(self):
@@ -125,7 +129,8 @@ class CalendarToolsTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result["success"])
-        self.assertEqual(captured["timeout"], 60.0)
+        self.assertIsInstance(captured["timeout"], httpx.Timeout)
+        self.assertEqual(captured["timeout"].read, 12.0)
         self.assertEqual(captured["headers"]["cal-api-version"], "2026-02-25")
         self.assertEqual(captured["json"]["start"], "2026-08-04T07:15:00Z")
 
@@ -158,6 +163,26 @@ class CalendarToolsTests(unittest.IsolatedAsyncioTestCase):
     def test_calcom_empty_text_error_uses_json_message(self):
         response = FakeResponse({"error": {"message": "slot already booked"}}, status_code=400)
         self.assertEqual(calendar_tools._cal_error_message(response), "slot already booked")
+
+    def test_cancellation_uses_calcom_v2_contract(self):
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return FakeResponse({"status": "success"})
+
+        with (
+            patch.object(calendar_tools, "get_cal_creds", return_value={"api_key": "cal_test", "event_id": 1}),
+            patch.object(calendar_tools.requests, "post", fake_post),
+        ):
+            result = calendar_tools.cancel_booking("booking-123", "Caller requested cancellation")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["url"], "https://api.cal.com/v2/bookings/booking-123/cancel")
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer cal_test")
+        self.assertEqual(captured["headers"]["cal-api-version"], "2026-02-25")
+        self.assertEqual(captured["json"]["cancellationReason"], "Caller requested cancellation")
 
     async def test_calcom_outage_is_not_confirmed(self):
         class OfflineClient:
@@ -316,6 +341,33 @@ class SupabaseReliabilityTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("connection outage", result["message"])
 
+    def test_cancellation_lookup_requires_exact_phone_and_name_match(self):
+        rows = [{
+            "id": "log-1", "phone_number": "09315085245", "caller_name": "Rahul Kumar",
+            "summary": "Booking Confirmed: cal-uid-1", "created_at": "2026-08-08T10:00:00Z",
+        }]
+
+        class FakeQuery:
+            def select(self, *_args): return self
+            def order(self, *_args, **_kwargs): return self
+            def limit(self, *_args): return self
+            def execute(self): return MagicMock(data=rows)
+
+        class FakeSupabase:
+            def table(self, table_name):
+                if table_name != "call_logs":
+                    raise AssertionError(f"Unexpected table: {table_name}")
+                return FakeQuery()
+
+        with patch.object(db, "get_supabase", return_value=FakeSupabase()):
+            matched = db.find_verified_booking_for_cancellation("+919315085245", "rahul  kumar")
+            rejected = db.find_verified_booking_for_cancellation("+919315085245", "Rahul Sharma")
+
+        self.assertTrue(matched["success"])
+        self.assertEqual(matched["booking"]["booking_id"], "cal-uid-1")
+        self.assertFalse(rejected["success"])
+        self.assertIn("No active appointment", rejected["message"])
+
 
 class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_booking_tool_confirms_then_waits_for_conversation_close(self):
@@ -323,33 +375,31 @@ class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         tools = AgentTools(caller_phone="+919315085245")
         created = {"success": True, "booking_id": "live-booking", "message": "Booking confirmed"}
-        scheduled_task = MagicMock()
-
-        def capture_scheduled_task(coro):
-            # This test checks scheduling only; close the coroutine rather than
-            # letting a mocked create_task leave it unawaited.
-            coro.close()
-            return scheduled_task
 
         with (
             patch("agent.is_slot_available", return_value=(True, [])),
             patch("agent.async_create_booking", new=AsyncMock(return_value=created)) as create,
-            patch("agent.notify_booking_confirmed", return_value=True) as notify,
-            patch("agent.asyncio.create_task", side_effect=capture_scheduled_task),
+            patch.object(tools, "_deliver_booking_notification", new=AsyncMock(return_value=True)) as notify,
+            patch.object(tools, "_schedule_closure_idle") as schedule_close,
         ):
             reply = await tools.save_booking_intent(
-                "2026-08-04T15:30:00+05:30", "Rahul", caller_email="Rahul123@gmail.com"
+                "2026-08-04T15:30:00+05:30",
+                "Rahul",
+                "R A H U L",
+                "Rahul123@gmail.com",
+                True,
             )
+            await asyncio.sleep(0)
 
         create.assert_awaited_once()
-        notify.assert_called_once()
+        notify.assert_awaited_once()
         self.assertTrue(tools.booking_result["success"])
         self.assertEqual(tools.booking_intent["caller_email"], "rahul123@gmail.com")
-        self.assertTrue(tools.booking_notification_sent)
+        self.assertIsNotNone(tools._booking_notification_task)
         self.assertIn("confirmed in Cal.com", reply)
         self.assertIn("anything else", reply)
         self.assertIsNone(tools._end_task)
-        self.assertIs(tools._closure_idle_task, scheduled_task)
+        schedule_close.assert_called_once_with(20)
 
     async def test_booking_tool_failure_does_not_start_hangup_or_claim_success(self):
         from agent import AgentTools
@@ -362,17 +412,42 @@ class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value={"success": False, "booking_id": None, "message": "slot already booked"}),
             ),
             patch("agent.notify_booking_confirmed") as notify,
-            patch("agent.asyncio.create_task") as create_task,
+            patch.object(tools, "_schedule_closure_idle") as schedule_close,
         ):
             reply = await tools.save_booking_intent(
-                "2026-08-04T15:30:00+05:30", "Rahul", caller_email="rahul123@gmail.com"
+                "2026-08-04T15:30:00+05:30",
+                "Rahul",
+                "R A H U L",
+                "rahul123@gmail.com",
+                True,
             )
 
         self.assertIsNone(tools.booking_intent)
         self.assertIsNotNone(tools.last_booking_failure)
         notify.assert_not_called()
-        create_task.assert_not_called()
+        schedule_close.assert_not_called()
         self.assertIn("not created", reply)
+
+    async def test_booking_requires_spelled_name_email_and_final_consent(self):
+        from agent import AgentTools
+
+        tools = AgentTools(caller_phone="+919315085245")
+        create = AsyncMock(return_value={"success": True, "booking_id": "should-not-exist"})
+        with patch("agent.async_create_booking", new=create):
+            name_reply = await tools.save_booking_intent(
+                "2026-08-04T15:30:00+05:30", "Ritik", "R I T H I K", "ritik@gmail.com", True
+            )
+            email_reply = await tools.save_booking_intent(
+                "2026-08-04T15:30:00+05:30", "Ritik", "R I T I K", "ritik at gmail", True
+            )
+            consent_reply = await tools.save_booking_intent(
+                "2026-08-04T15:30:00+05:30", "Ritik", "R I T I K", "ritik at gmail dot com", False
+            )
+
+        create.assert_not_awaited()
+        self.assertIn("does not match", name_reply)
+        self.assertIn("missing or invalid", email_reply)
+        self.assertIn("clear yes", consent_reply)
 
     async def test_automatic_termination_deletes_room(self):
         from agent import AgentTools
