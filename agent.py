@@ -190,6 +190,7 @@ def get_language_instruction(lang_preset: str) -> str:
 # ── External imports ──────────────────────────────────────────────────────────
 import db  # FIX: was missing — db.get_supabase() used throughout
 from calendar_tools import (
+    CalendarAvailabilityError,
     get_available_slots,
     is_slot_available,
     normalize_email,
@@ -455,7 +456,10 @@ class AgentTools(llm.ToolContext):
 
         if not result.get("success"):
             self.last_booking_failure = {**intent, "message": result.get("message", "Booking failed")}
-            _available_now, fresh_alternatives = await asyncio.to_thread(is_slot_available, start_time)
+            try:
+                _available_now, fresh_alternatives = await asyncio.to_thread(is_slot_available, start_time)
+            except CalendarAvailabilityError:
+                fresh_alternatives = []
             suggestions = ", ".join(fresh_alternatives[:6])
             if suggestions:
                 return (

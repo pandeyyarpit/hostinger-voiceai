@@ -20,6 +20,10 @@ EMAIL_PATTERN = re.compile(
 )
 
 
+class CalendarAvailabilityError(RuntimeError):
+    """Raised when Cal.com availability cannot be verified reliably."""
+
+
 def get_cal_creds() -> dict:
     return {
         "api_key":  os.environ.get("CAL_API_KEY", ""),
@@ -95,41 +99,58 @@ def get_available_slots(date_str: str) -> list:
 
 def _get_slots_calcom(date_str: str) -> list:
     creds = get_cal_creds()
-    try:
-        start_utc, end_utc = _ist_day_range_as_utc(date_str)
-        resp = requests.get(
-            f"{CAL_V2_BASE}/slots",
-            headers={
-                "Authorization":  f"Bearer {creds['api_key']}",
-                "cal-api-version": CAL_SLOTS_API_VERSION,
-                "Content-Type":   "application/json",
-            },
-            params={
-                "eventTypeId": creds["event_id"],
-                "start":       start_utc,
-                "end":         end_utc,
-                "timeZone":    "Asia/Kolkata",
-            },
-            timeout=6,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        # v2 response: {"data": {"YYYY-MM-DD": [{"start": "..."}, ...]}}
-        raw_slots = body.get("data", {}).get(date_str, [])
-        slots = []
-        for s in raw_slots:
-            slot_time = s.get("start") or s.get("time", "")
-            if not slot_time:
-                continue
-            dt = datetime.fromisoformat(slot_time)
-            # Convert UTC to IST for display
-            dt_ist = dt.astimezone(IST)
-            slots.append({"time": slot_time, "label": dt_ist.strftime("%-I:%M %p")})
-        logger.info(f"[CAL] {len(slots)} slots for {date_str}")
-        return slots
-    except Exception as e:
-        logger.error(f"[CAL] get_available_slots error: {e}")
-        return []
+    start_utc, end_utc = _ist_day_range_as_utc(date_str)
+    last_error = None
+
+    # A transient timeout must never be reported to the caller as a genuinely
+    # empty calendar. Retry once, then raise a typed error that the voice tool
+    # can explain without inventing slot availability.
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                f"{CAL_V2_BASE}/slots",
+                headers={
+                    "Authorization":  f"Bearer {creds['api_key']}",
+                    "cal-api-version": CAL_SLOTS_API_VERSION,
+                    "Content-Type":   "application/json",
+                },
+                params={
+                    "eventTypeId": creds["event_id"],
+                    "start":       start_utc,
+                    "end":         end_utc,
+                    "timeZone":    "Asia/Kolkata",
+                },
+                timeout=(3, 8),
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            # v2 response: {"data": {"YYYY-MM-DD": [{"start": "..."}, ...]}}
+            raw_slots = body.get("data", {}).get(date_str, [])
+            slots = []
+            for s in raw_slots:
+                slot_time = s.get("start") or s.get("time", "")
+                if not slot_time:
+                    continue
+                dt = datetime.fromisoformat(slot_time)
+                # Convert UTC to IST for display
+                dt_ist = dt.astimezone(IST)
+                slots.append({"time": slot_time, "label": dt_ist.strftime("%-I:%M %p")})
+            logger.info(f"[CAL] {len(slots)} slots for {date_str}")
+            return slots
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_error = e
+            logger.warning("[CAL] Availability attempt %s/2 failed: %s", attempt + 1, e)
+        except requests.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", 0) or 0
+            if status and status < 500:
+                raise CalendarAvailabilityError(f"Cal.com rejected the availability request (HTTP {status}).") from e
+            last_error = e
+            logger.warning("[CAL] Availability attempt %s/2 failed: %s", attempt + 1, e)
+        except Exception as e:
+            raise CalendarAvailabilityError(f"Cal.com availability response was invalid: {e}") from e
+
+    logger.error("[CAL] Availability unavailable after retries: %s", last_error)
+    raise CalendarAvailabilityError("Cal.com availability is temporarily unavailable. Please try again shortly.") from last_error
 
 
 def is_slot_available(start_time: str) -> tuple[bool, list[str]]:
@@ -281,7 +302,14 @@ async def _create_booking_calcom(
     # ``is_slot_available`` uses the synchronous Cal.com slots endpoint.
     # Keep that network wait off the voice-agent event loop so it can continue
     # streaming TTS while the calendar is being checked.
-    available, _ = await asyncio.to_thread(is_slot_available, start_time)
+    try:
+        available, _ = await asyncio.to_thread(is_slot_available, start_time)
+    except CalendarAvailabilityError:
+        return {
+            "success": False,
+            "booking_id": None,
+            "message": "The calendar could not verify availability, so no booking was attempted. Please try again shortly.",
+        }
     if not available:
         return {
             "success": False,

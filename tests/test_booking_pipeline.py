@@ -60,6 +60,27 @@ class CalendarToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["params"]["start"], "2026-08-03T18:30:00Z")
         self.assertEqual(captured["headers"]["cal-api-version"], "2024-09-04")
 
+    def test_slot_lookup_retries_a_transient_timeout(self):
+        success = FakeResponse({"data": {"2026-08-04": [{"start": "2026-08-04T12:45:00+05:30"}]}})
+        with patch.object(
+            calendar_tools.requests,
+            "get",
+            side_effect=[calendar_tools.requests.Timeout("temporary timeout"), success],
+        ) as request:
+            slots = calendar_tools._get_slots_calcom("2026-08-04")
+
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(slots[0]["label"], "12:45 PM")
+
+    def test_slot_outage_is_not_reported_as_an_empty_calendar(self):
+        with patch.object(
+            calendar_tools.requests,
+            "get",
+            side_effect=calendar_tools.requests.Timeout("persistent timeout"),
+        ):
+            with self.assertRaises(calendar_tools.CalendarAvailabilityError):
+                calendar_tools._get_slots_calcom("2026-08-04")
+
     async def test_stale_slot_never_reaches_booking_api(self):
         with patch.object(calendar_tools, "is_slot_available", return_value=(False, [])):
             result = await calendar_tools._create_booking_calcom(
@@ -68,6 +89,19 @@ class CalendarToolsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["success"])
         self.assertIn("no longer available", result["message"])
+
+    async def test_booking_is_not_attempted_when_availability_cannot_be_verified(self):
+        with patch.object(
+            calendar_tools,
+            "is_slot_available",
+            side_effect=calendar_tools.CalendarAvailabilityError("temporary outage"),
+        ):
+            result = await calendar_tools._create_booking_calcom(
+                "2026-08-04T13:45:00+05:30", "Test", "+919315085245", "test@example.com", ""
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("no booking was attempted", result["message"])
 
     async def test_timeout_reconciles_existing_booking(self):
         class TimeoutThenFoundClient:
