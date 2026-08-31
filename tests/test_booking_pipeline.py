@@ -409,6 +409,11 @@ class SupabaseReliabilityTests(unittest.TestCase):
 
 
 class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_booking_prompt_requires_letters_then_spoken_name(self):
+        source = Path(__file__).resolve().parents[1].joinpath("agent.py").read_text()
+        self.assertIn("A R P I T, Arpit", source)
+        self.assertIn("Never confirm with only the letters or only the name", source)
+
     async def test_booking_tool_confirms_then_waits_for_conversation_close(self):
         from agent import AgentTools
 

@@ -406,14 +406,14 @@ class AgentTools(llm.ToolContext):
             logger.warning(f"[END-CALL] Closing idle fallback failed: {e}")
 
     # ── Tool: Save Booking Intent ─────────────────────────────────────────
-    @llm.function_tool(description="Create the Cal.com appointment only after the caller has spelled their first name, spelled their email including at and dot, heard both details repeated back, and clearly said yes to booking the exact ISO slot. The spelled first name is authoritative if speech recognition heard the earlier name differently. Call this ONCE after confirmation. It returns the real booking result.")
+    @llm.function_tool(description="Create the Cal.com appointment only after the caller has spelled their first name, heard the letters followed by the complete name (for example: A R P I T, Arpit), spelled their email including at and dot, heard both details repeated back, and clearly said yes to booking the exact ISO slot. The spelled first name is authoritative if speech recognition heard the earlier name differently. Call this ONCE after confirmation. It returns the real booking result.")
     async def save_booking_intent(
         self,
         start_time:   Annotated[str,  "ISO 8601 datetime e.g. '2026-03-01T10:00:00+05:30'"],
         caller_name:  Annotated[str,  "Full name initially heard; its first name will be replaced by the verified spelling"],
         spelled_first_name: Annotated[str, "Authoritative first name exactly as the caller spelled it letter by letter"],
         caller_email: Annotated[str,  "Email exactly as the caller spelled it, including at and dot"],
-        booking_confirmed: Annotated[bool, "True only after repeating the verified name and email and the caller clearly says yes"],
+        booking_confirmed: Annotated[bool, "True only after repeating the name as letters then complete name, repeating the email, and the caller clearly says yes"],
         caller_phone: Annotated[str,  "Phone number of the caller; omit when it is already known from the call" ] = "",
         notes:        Annotated[str,  "Any additional notes or special requests"] = "",
     ) -> str:
@@ -637,6 +637,7 @@ class OutboundAssistant(Agent):
             "When the caller agrees to an appointment date and time: first collect their full name; then ask them to spell their FIRST NAME letter by letter; "
             "then ask them to spell their email slowly, including at and dot. Email is required for every booking. "
             "Treat the spelled first name as the source of truth even if it differs from the name speech recognition heard earlier; keep any surname and do not ask for the first name again. "
+            "Immediately repeat the verified name as spaced letters followed by the complete spoken name, for example: 'A R P I T, Arpit.' Never confirm with only the letters or only the name. "
             "If the email has an obvious major-provider typo such as gamil.com, ask whether they meant gmail.com and use the corrected address only after they say yes. Never silently correct it. "
             "Repeat the verified first name, full email, and selected time back to the caller, and ask: 'Shall I book this appointment?' "
             "Only after a clear yes may you call save_booking_intent during the active call. Pass the normal full name, the separately spelled first name, "
