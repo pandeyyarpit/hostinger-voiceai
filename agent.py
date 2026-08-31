@@ -809,7 +809,8 @@ async def entrypoint(ctx: JobContext):
             agent_stt = sarvam.STT(
                 language=stt_language,
                 model="saaras:v3",
-                mode="translate",
+                # Preserve the caller's original language so the LLM can mirror it.
+                mode="transcribe",
                 flush_signal=True,
                 sample_rate=16000,
             )
@@ -817,7 +818,8 @@ async def entrypoint(ctx: JobContext):
         agent_stt = sarvam.STT(
             language=stt_language,      # "unknown" = auto-detect (#20)
             model="saaras:v3",
-            mode="translate",
+            # "translate" converted Hindi speech to English before the LLM saw it.
+            mode="transcribe",
             flush_signal=True,
             sample_rate=16000,          # force 16kHz (#1)
         )
