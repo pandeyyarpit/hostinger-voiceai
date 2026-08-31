@@ -195,6 +195,7 @@ from calendar_tools import (
     is_slot_available,
     normalize_email,
     is_valid_email,
+    suggest_email_correction,
     async_create_booking,
     create_booking,
     cancel_booking,
@@ -254,6 +255,18 @@ class AgentTools(llm.ToolContext):
         if len(parts) > 1 and all(len(cls._normalise_first_name(part)) == 1 for part in parts):
             return "".join(parts)
         return parts[0]
+
+    @classmethod
+    def _name_with_spelled_first_name(cls, full_name: str, spelled_first_name: str) -> str:
+        """Use the caller's spelling as truth while preserving any surname."""
+        verified_first_name = cls._normalise_first_name(spelled_first_name)
+        if not verified_first_name:
+            return (full_name or "").strip()
+        display_first_name = verified_first_name.title()
+        parts = [part for part in (full_name or "").strip().split() if part]
+        if len(parts) > 1 and not all(len(cls._normalise_first_name(part)) == 1 for part in parts):
+            return " ".join([display_first_name, *parts[1:]])
+        return display_first_name
 
     async def _say_progress(self, text: str) -> None:
         """Give a short audible status update without adding it to the LLM chat."""
@@ -393,12 +406,12 @@ class AgentTools(llm.ToolContext):
             logger.warning(f"[END-CALL] Closing idle fallback failed: {e}")
 
     # ── Tool: Save Booking Intent ─────────────────────────────────────────
-    @llm.function_tool(description="Create the Cal.com appointment only after the caller has spelled their first name, spelled their email including at and dot, heard both details repeated back, and clearly said yes to booking the exact ISO slot. Call this ONCE. It returns the real booking result.")
+    @llm.function_tool(description="Create the Cal.com appointment only after the caller has spelled their first name, spelled their email including at and dot, heard both details repeated back, and clearly said yes to booking the exact ISO slot. The spelled first name is authoritative if speech recognition heard the earlier name differently. Call this ONCE after confirmation. It returns the real booking result.")
     async def save_booking_intent(
         self,
         start_time:   Annotated[str,  "ISO 8601 datetime e.g. '2026-03-01T10:00:00+05:30'"],
-        caller_name:  Annotated[str,  "Full name stated by the caller before spelling verification"],
-        spelled_first_name: Annotated[str, "First name exactly as the caller spelled it letter by letter"],
+        caller_name:  Annotated[str,  "Full name initially heard; its first name will be replaced by the verified spelling"],
+        spelled_first_name: Annotated[str, "Authoritative first name exactly as the caller spelled it letter by letter"],
         caller_email: Annotated[str,  "Email exactly as the caller spelled it, including at and dot"],
         booking_confirmed: Annotated[bool, "True only after repeating the verified name and email and the caller clearly says yes"],
         caller_phone: Annotated[str,  "Phone number of the caller; omit when it is already known from the call" ] = "",
@@ -409,17 +422,19 @@ class AgentTools(llm.ToolContext):
         logger.info(f"[TOOL] save_booking_intent: {caller_name} at {start_time}, email={caller_email}")
         if not caller_phone or caller_phone == "unknown":
             return "I still need the caller's phone number before I can save the appointment."
-        expected_first_name = self._normalise_first_name(self._first_name_from_full_name(caller_name))
         spelled_name = self._normalise_first_name(spelled_first_name)
-        if not expected_first_name or not spelled_name:
+        if not spelled_name:
             return (
                 "I still need the caller to spell their first name letter by letter. "
                 "Ask them to spell it, repeat it back, and do not save the appointment yet."
             )
-        if expected_first_name != spelled_name:
+        verified_caller_name = self._name_with_spelled_first_name(caller_name, spelled_first_name)
+        suggested_email = suggest_email_correction(caller_email)
+        if suggested_email:
             return (
-                "The spelled first name does not match the name provided. Ask the caller to state and spell "
-                "their first name again, then repeat it back. Do not save the appointment yet."
+                f"The email has a likely provider typo. Ask exactly: 'I heard {caller_email}. "
+                f"Did you mean {suggested_email}?' Do not book yet. If the caller says yes, call this tool again "
+                "with the corrected email and booking_confirmed=true. If they say no, ask them to spell it again."
             )
         if not caller_email or not is_valid_email(caller_email):
             return (
@@ -436,7 +451,7 @@ class AgentTools(llm.ToolContext):
 
         intent = {
             "start_time":   start_time,
-            "caller_name":  caller_name,
+            "caller_name":  verified_caller_name,
             "caller_phone": caller_phone,
             "caller_email": caller_email,
             "notes":        notes,
@@ -471,12 +486,12 @@ class AgentTools(llm.ToolContext):
         self.booking_intent = intent
         self.booking_result = result
         self.last_booking_failure = None
-        self.caller_name = caller_name
+        self.caller_name = verified_caller_name
         # Telegram and WhatsApp can each take several seconds.  Deliver them
         # in the background so the caller receives the Cal.com confirmation
         # immediately, then await/retry the task safely during shutdown.
         self._booking_notification_task = asyncio.create_task(self._deliver_booking_notification(
-            caller_name=caller_name,
+            caller_name=verified_caller_name,
             caller_phone=caller_phone,
             booking_time_iso=start_time,
             booking_id=result.get("booking_id", "unknown"),
@@ -621,6 +636,8 @@ class OutboundAssistant(Agent):
             "\n\n[BOOKING ACTION — STRICT]\n"
             "When the caller agrees to an appointment date and time: first collect their full name; then ask them to spell their FIRST NAME letter by letter; "
             "then ask them to spell their email slowly, including at and dot. Email is required for every booking. "
+            "Treat the spelled first name as the source of truth even if it differs from the name speech recognition heard earlier; keep any surname and do not ask for the first name again. "
+            "If the email has an obvious major-provider typo such as gamil.com, ask whether they meant gmail.com and use the corrected address only after they say yes. Never silently correct it. "
             "Repeat the verified first name, full email, and selected time back to the caller, and ask: 'Shall I book this appointment?' "
             "Only after a clear yes may you call save_booking_intent during the active call. Pass the normal full name, the separately spelled first name, "
             "the spelled email, and booking_confirmed=true. The caller's phone number is already known for inbound calls, so omit it unless changed. "

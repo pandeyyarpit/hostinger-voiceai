@@ -38,6 +38,11 @@ class CalendarToolsTests(unittest.IsolatedAsyncioTestCase):
             "ritik@gmail.com",
         )
         self.assertFalse(calendar_tools.is_valid_email("arpit123@gmail"))
+        self.assertEqual(
+            calendar_tools.suggest_email_correction("Karpity@gamil.com"),
+            "karpity@gmail.com",
+        )
+        self.assertIsNone(calendar_tools.suggest_email_correction("patient@clinic.example"))
 
     def test_ist_day_range_is_sent_to_calcom_in_utc(self):
         self.assertEqual(
@@ -462,15 +467,31 @@ class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
         schedule_close.assert_not_called()
         self.assertIn("not created", reply)
 
-    async def test_booking_requires_spelled_name_email_and_final_consent(self):
+    async def test_spelled_first_name_overrides_initial_transcription(self):
+        from agent import AgentTools
+
+        tools = AgentTools(caller_phone="+919315085245")
+        create = AsyncMock(return_value={"success": True, "booking_id": "verified-name"})
+        with (
+            patch("agent.async_create_booking", new=create),
+            patch.object(tools, "_deliver_booking_notification", new=AsyncMock(return_value=True)),
+            patch.object(tools, "_schedule_closure_idle"),
+        ):
+            reply = await tools.save_booking_intent(
+                "2026-09-01T10:00:00+05:30", "Arthak Pandey", "A R P I T", "arpit@gmail.com", True
+            )
+
+        create.assert_awaited_once()
+        self.assertEqual(create.await_args.kwargs["caller_name"], "Arpit Pandey")
+        self.assertEqual(tools.booking_intent["caller_name"], "Arpit Pandey")
+        self.assertIn("confirmed in Cal.com", reply)
+
+    async def test_booking_requires_valid_email_and_final_consent(self):
         from agent import AgentTools
 
         tools = AgentTools(caller_phone="+919315085245")
         create = AsyncMock(return_value={"success": True, "booking_id": "should-not-exist"})
         with patch("agent.async_create_booking", new=create):
-            name_reply = await tools.save_booking_intent(
-                "2026-08-04T15:30:00+05:30", "Ritik", "R I T H I K", "ritik@gmail.com", True
-            )
             email_reply = await tools.save_booking_intent(
                 "2026-08-04T15:30:00+05:30", "Ritik", "R I T I K", "ritik at gmail", True
             )
@@ -479,9 +500,22 @@ class AgentAndUiRegressionTests(unittest.IsolatedAsyncioTestCase):
             )
 
         create.assert_not_awaited()
-        self.assertIn("does not match", name_reply)
         self.assertIn("missing or invalid", email_reply)
         self.assertIn("clear yes", consent_reply)
+
+    async def test_common_email_typo_requires_explicit_correction_confirmation(self):
+        from agent import AgentTools
+
+        tools = AgentTools(caller_phone="+919315085245")
+        create = AsyncMock(return_value={"success": True, "booking_id": "should-not-exist"})
+        with patch("agent.async_create_booking", new=create):
+            reply = await tools.save_booking_intent(
+                "2026-09-01T10:00:00+05:30", "Arpit Pandey", "A R P I T", "karpity@gamil.com", True
+            )
+
+        create.assert_not_awaited()
+        self.assertIn("karpity@gmail.com", reply)
+        self.assertIn("Do not book yet", reply)
 
     async def test_automatic_termination_deletes_room(self):
         from agent import AgentTools

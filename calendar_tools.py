@@ -19,6 +19,19 @@ EMAIL_PATTERN = re.compile(
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
 )
 
+# Only correct unmistakable typos for major public email providers.  We do not
+# fuzzy-match arbitrary domains because a clinic caller may use a legitimate
+# custom address.  The suggested value still has to be read back and approved.
+COMMON_EMAIL_DOMAIN_CORRECTIONS = {
+    "gamil.com": "gmail.com",
+    "gmial.com": "gmail.com",
+    "gmai.com": "gmail.com",
+    "gmail.co": "gmail.com",
+    "hotnail.com": "hotmail.com",
+    "outlok.com": "outlook.com",
+    "yaho.com": "yahoo.com",
+}
+
 
 class CalendarAvailabilityError(RuntimeError):
     """Raised when Cal.com availability cannot be verified reliably."""
@@ -48,6 +61,18 @@ def normalize_email(email: str) -> str:
 
 def is_valid_email(email: str) -> bool:
     return bool(EMAIL_PATTERN.fullmatch(email))
+
+
+def suggest_email_correction(email: str) -> str | None:
+    """Suggest a safe provider-domain correction that requires caller approval."""
+    normalized = normalize_email(email)
+    local_part, separator, domain = normalized.rpartition("@")
+    if not separator or not local_part:
+        return None
+    corrected_domain = COMMON_EMAIL_DOMAIN_CORRECTIONS.get(domain)
+    if not corrected_domain:
+        return None
+    return f"{local_part}@{corrected_domain}"
 
 
 def _to_utc_iso(value: datetime) -> str:
