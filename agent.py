@@ -126,7 +126,7 @@ def get_live_config(phone_number: str | None = None):
         "stt_min_endpointing_delay":config.get("stt_min_endpointing_delay", 0.05),
         "llm_model":                config.get("llm_model", "gpt-4o-mini"),
         "llm_provider":             config.get("llm_provider", "openai"),
-        "tts_voice":                config.get("tts_voice", "kavya"),
+        "tts_voice":                config.get("tts_voice", "shreya"),
         "tts_language":             config.get("tts_language", "hi-IN"),
         "tts_provider":             config.get("tts_provider", "sarvam"),
         "stt_provider":             config.get("stt_provider", "sarvam"),
@@ -179,7 +179,7 @@ LANGUAGE_PRESETS = {
     "marathi":     {"label": "Marathi",                 "tts_language": "mr-IN", "tts_voice": "shubh",  "instruction": "Speak only in Marathi. Use polite, standard spoken Marathi."},
     "kannada":     {"label": "Kannada",                 "tts_language": "kn-IN", "tts_voice": "rahul",  "instruction": "Speak only in Kannada. Use clear, professional spoken Kannada."},
     "malayalam":   {"label": "Malayalam",               "tts_language": "ml-IN", "tts_voice": "ritu",   "instruction": "Speak only in Malayalam. Use polite, professional spoken Malayalam."},
-    "multilingual":{"label": "Multilingual (Auto)",     "tts_language": "hi-IN", "tts_voice": "kavya",  "instruction": "Detect the caller's language from their first message and reply in that SAME language for the entire call. Supported: Hindi, Hinglish, English, Tamil, Telugu, Gujarati, Bengali, Marathi, Kannada, Malayalam. Switch if caller switches."},
+    "multilingual":{"label": "Multilingual (Auto)",     "tts_language": "hi-IN", "tts_voice": "shreya", "instruction": "Detect the caller's language from their first message and reply in that SAME language for the entire call. Supported: Hindi, Hinglish, English, Tamil, Telugu, Gujarati, Bengali, Marathi, Kannada, Malayalam. Switch if caller switches."},
 }
 
 def get_language_instruction(lang_preset: str) -> str:
@@ -744,7 +744,7 @@ async def entrypoint(ctx: JobContext):
     delay_setting = live_config.get("stt_min_endpointing_delay", 0.25)
     llm_model     = live_config.get("llm_model", "gpt-4o-mini")
     llm_provider  = live_config.get("llm_provider", "openai")
-    tts_voice     = live_config.get("tts_voice", "kavya")
+    tts_voice     = live_config.get("tts_voice", "shreya")
     tts_language  = live_config.get("tts_language", "hi-IN")
     tts_provider  = live_config.get("tts_provider", "sarvam")
     stt_provider  = live_config.get("stt_provider", "sarvam")

@@ -41,7 +41,7 @@ def read_config():
         "agent_instructions": get_val("agent_instructions", "AGENT_INSTRUCTIONS", ""),
         "stt_min_endpointing_delay": float(get_val("stt_min_endpointing_delay", "STT_MIN_ENDPOINTING_DELAY", 0.6)),
         "llm_model": get_val("llm_model", "LLM_MODEL", "gpt-4o-mini"),
-        "tts_voice": get_val("tts_voice", "TTS_VOICE", "kavya"),
+        "tts_voice": get_val("tts_voice", "TTS_VOICE", "shreya"),
         "tts_language": get_val("tts_language", "TTS_LANGUAGE", "hi-IN"),
         "livekit_url": get_val("livekit_url", "LIVEKIT_URL", ""),
         "sip_trunk_id": get_val("sip_trunk_id", "OUTBOUND_TRUNK_ID", ""),
@@ -1620,14 +1620,13 @@ async function selectLangPreset(id) {{
   if (!p) return;
   currentLangPreset = id;
   renderLangGrid();
-  // Save lang_preset, tts_language, tts_voice to config
+  // Save only the language settings. Keep the speaker voice selected by the user.
   try {{
     const cfg = await fetch('/api/config').then(r=>r.json());
-    const voices = {{ hinglish:'kavya', hindi:'ritu', english:'dev', tamil:'priya', telugu:'kavya', gujarati:'rohan', bengali:'neha', marathi:'shubh', kannada:'rahul', malayalam:'ritu', multilingual:'kavya' }};
     const langs  = {{ hinglish:'hi-IN', hindi:'hi-IN', english:'en-IN', tamil:'ta-IN', telugu:'te-IN', gujarati:'gu-IN', bengali:'bn-IN', marathi:'mr-IN', kannada:'kn-IN', malayalam:'ml-IN', multilingual:'hi-IN' }};
     await fetch('/api/config', {{
       method:'POST', headers:{{'Content-Type':'application/json'}},
-      body: JSON.stringify({{ lang_preset: id, tts_language: langs[id], tts_voice: voices[id] }})
+      body: JSON.stringify({{ lang_preset: id, tts_language: langs[id] }})
     }});
     const toast = document.createElement('div');
     toast.style.cssText='position:fixed;bottom:24px;right:24px;background:#22c55e;color:#fff;padding:12px 20px;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;animation:slideUp 0.3s ease';

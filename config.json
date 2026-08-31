@@ -4,7 +4,7 @@
     "vad_activation_threshold": 0.65,
     "vad_min_speech_duration": 0.15,
     "llm_model": "gpt-4o-mini",
-    "tts_voice": "kavya",
+    "tts_voice": "shreya",
     "tts_language": "hi-IN",
     "lang_preset": "multilingual",
     "livekit_url": "wss://hostinger-yt-trial-upqbgkdt.livekit.cloud",
